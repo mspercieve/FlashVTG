@@ -1,9 +1,0 @@
-{"time":"2025-03-24T13:40:56.835299779+09:00","level":"INFO","msg":"using version","core version":"0.18.7"}
-{"time":"2025-03-24T13:40:56.835324817+09:00","level":"INFO","msg":"created symlink","path":"/SSD1/minseok/MR_HD/FlashVTG/wandb/run-20250324_134056-vfww3yjg/logs/debug-core.log"}
-{"time":"2025-03-24T13:40:56.943522306+09:00","level":"INFO","msg":"created new stream","id":"vfww3yjg"}
-{"time":"2025-03-24T13:40:56.94361248+09:00","level":"INFO","msg":"stream: started","id":"vfww3yjg"}
-{"time":"2025-03-24T13:40:56.943672676+09:00","level":"INFO","msg":"writer: Do: started","stream_id":"vfww3yjg"}
-{"time":"2025-03-24T13:40:56.943706972+09:00","level":"INFO","msg":"handler: started","stream_id":"vfww3yjg"}
-{"time":"2025-03-24T13:40:56.943774232+09:00","level":"INFO","msg":"sender: started","stream_id":"vfww3yjg"}
-{"time":"2025-03-24T13:40:57.375528585+09:00","level":"INFO","msg":"Starting system monitor"}
-{"time":"2025-03-24T13:41:07.479318789+09:00","level":"INFO","msg":"tensorboard: no root directory after 10 seconds, using working directory"}

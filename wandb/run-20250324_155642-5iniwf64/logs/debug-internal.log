@@ -1,9 +1,0 @@
-{"time":"2025-03-24T15:56:42.640438635+09:00","level":"INFO","msg":"using version","core version":"0.18.7"}
-{"time":"2025-03-24T15:56:42.640460808+09:00","level":"INFO","msg":"created symlink","path":"/SSD1/minseok/MR_HD/FlashVTG/wandb/run-20250324_155642-5iniwf64/logs/debug-core.log"}
-{"time":"2025-03-24T15:56:42.746006078+09:00","level":"INFO","msg":"created new stream","id":"5iniwf64"}
-{"time":"2025-03-24T15:56:42.746064621+09:00","level":"INFO","msg":"stream: started","id":"5iniwf64"}
-{"time":"2025-03-24T15:56:42.746094128+09:00","level":"INFO","msg":"writer: Do: started","stream_id":"5iniwf64"}
-{"time":"2025-03-24T15:56:42.746097164+09:00","level":"INFO","msg":"handler: started","stream_id":"5iniwf64"}
-{"time":"2025-03-24T15:56:42.746114527+09:00","level":"INFO","msg":"sender: started","stream_id":"5iniwf64"}
-{"time":"2025-03-24T15:56:43.119433647+09:00","level":"INFO","msg":"Starting system monitor"}
-{"time":"2025-03-24T15:56:53.200322813+09:00","level":"INFO","msg":"tensorboard: no root directory after 10 seconds, using working directory"}
