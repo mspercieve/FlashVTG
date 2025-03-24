@@ -1,0 +1,28 @@
+2025-03-21 17:35:29,336 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Current SDK version is 0.18.7
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Configure stats pid to 637473
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Loading settings from /home/mvpserver20/.config/wandb/settings
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Loading settings from /SSD1/minseok/MR_HD/FlashVTG/wandb/settings
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Loading settings from environment variables: {}
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Applying setup settings: {'mode': None, '_disable_service': None}
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Inferring run settings from compute environment: {'program_relpath': 'FlashVTG_ms/train.py', 'program_abspath': '/SSD1/minseok/MR_HD/FlashVTG/FlashVTG_ms/train.py', 'program': 'FlashVTG_ms/train.py'}
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_setup.py:_flush():79] Applying login settings: {}
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_init.py:_log_setup():533] Logging user logs to /SSD1/minseok/MR_HD/FlashVTG/wandb/run-20250321_173529-t9zritya/logs/debug.log
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_init.py:_log_setup():534] Logging internal logs to /SSD1/minseok/MR_HD/FlashVTG/wandb/run-20250321_173529-t9zritya/logs/debug-internal.log
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_init.py:init():619] calling init triggers
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_init.py:init():627] wandb.init called with sweep_config: {}
+config: {}
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_init.py:init():669] starting backend
+2025-03-21 17:35:29,337 INFO    MainThread:637473 [wandb_init.py:init():673] sending inform_init request
+2025-03-21 17:35:29,341 INFO    MainThread:637473 [backend.py:_multiprocessing_setup():106] multiprocessing start_methods=fork,spawn,forkserver, using: spawn
+2025-03-21 17:35:29,341 INFO    MainThread:637473 [wandb_init.py:init():686] backend started and connected
+2025-03-21 17:35:29,349 INFO    MainThread:637473 [wandb_init.py:init():781] updated telemetry
+2025-03-21 17:35:29,585 INFO    MainThread:637473 [wandb_init.py:init():814] communicating run to backend with 90.0 second timeout
+2025-03-21 17:35:29,790 ERROR   MainThread:637473 [wandb_init.py:init():841] encountered error: failed to upsert bucket: returned error 403 Forbidden: {"errors":[{"message":"permission denied","path":["upsertBucket"],"extensions":{"code":"PERMISSION_ERROR"}}],"data":{"upsertBucket":null}}
+2025-03-21 17:35:29,790 ERROR   MainThread:637473 [wandb_init.py:init():1266] error in wandb.init()
+Traceback (most recent call last):
+  File "/home/mvpserver20/anaconda3/envs/cgdetr/lib/python3.7/site-packages/wandb/sdk/wandb_init.py", line 1256, in init
+    return wi.init()
+  File "/home/mvpserver20/anaconda3/envs/cgdetr/lib/python3.7/site-packages/wandb/sdk/wandb_init.py", line 847, in init
+    raise error
+wandb.errors.errors.CommError: failed to upsert bucket: returned error 403 Forbidden: {"errors":[{"message":"permission denied","path":["upsertBucket"],"extensions":{"code":"PERMISSION_ERROR"}}],"data":{"upsertBucket":null}}
+2025-03-21 17:35:29,798 WARNING MsgRouterThr:637473 [router.py:message_loop():75] message_loop has been closed

@@ -138,7 +138,6 @@ class BundleLoss(nn.Module):
     def loss_cls(self, data, output, cls_tgt):
         src = data['out_class'].squeeze(-1)
         msk = torch.cat(data['pymid_msk'], dim=1)
-
         loss_cls = self._loss_cls(src, cls_tgt, weight=msk, avg_factor=msk.sum())
 
         output['loss_cls'] = loss_cls

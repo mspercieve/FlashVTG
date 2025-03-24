@@ -1,39 +1,35 @@
 dset_name=hl
 ctx_mode=video_tef
-v_feat_types=clip_slowfast
-t_feat_type=clip
+v_feat_types=internvideo2
+t_feat_type=internvideo2
 results_root=results
-exp_id=demo
-
+exp_id=exp
+device_id=1
 ######## data paths
 train_path=data/highlight_train_release.jsonl
 eval_path=data/highlight_val_release.jsonl
 eval_split_name=val
 
 ######## setup video+text features
-feat_root=/home/caozhuo/data_ssd/qvhighlight_ori/features
+feat_root='/SSD1/minseok/MR_HD/DB'
 
 # video features
 v_feat_dim=0
 v_feat_dirs=()
-if [[ ${v_feat_types} == *"slowfast"* ]]; then
-  v_feat_dirs+=(${feat_root}/slowfast_features)
-  (( v_feat_dim += 2304 ))  # double brackets for arithmetic op, no need to use ${v_feat_dim}
-fi
-if [[ ${v_feat_types} == *"clip"* ]]; then
-  v_feat_dirs+=(${feat_root}/clip_features)
-  (( v_feat_dim += 512 ))
+
+if [[ ${v_feat_types} == *"internvideo2"* ]]; then
+  v_feat_dirs+=(${feat_root}/features/internvid_features/qvhighlights/stage2_video/fps2/l40_vid_pool/)
+  (( v_feat_dim += 768))
 fi
 
 # text features
-if [[ ${t_feat_type} == "clip" ]]; then
-  t_feat_dir=${feat_root}/clip_text_features/
-  t_feat_dim=512
+if [[ ${t_feat_type} == "internvideo2" ]]; then
+  t_feat_dir=${feat_root}/features/internvid_features/qvhighlights/text/
+  t_feat_dim=4096
 else
   echo "Wrong arg for t_feat_type."
   exit 1
 fi
-
 #### training
 bsz=64
 max_v_l=75
@@ -45,7 +41,7 @@ eval_bsz=1
 enc_layers=3
 t2v_layers=6
 dummy_layers=2
-num_dummies=40
+num_dummies=10
 kernel_size=5
 num_conv_layers=1
 num_mlp_layers=5
@@ -91,5 +87,6 @@ data/MR.py \
 --num_conv_layers ${num_conv_layers} \
 --num_mlp_layers ${num_mlp_layers} \
 --label_loss_coef ${label_loss_coef} \
+--device ${device_id} \
 --use_SRM \
 ${@:1}

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
-
+import wandb
 from FlashVTG.config import TestOptions
 from FlashVTG.start_end_dataset import (
     StartEndDataset,
@@ -427,7 +427,7 @@ def eval_epoch(
 def setup_model(opt):
     """setup model/optimizer/scheduler and load checkpoints when needed"""
     logger.info("setup model/optimizer/scheduler")
-    from FlashVTG.model import build_model1
+    from FlashVTG_ms.model import build_model1
     model, criterion = build_model1(opt)
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")

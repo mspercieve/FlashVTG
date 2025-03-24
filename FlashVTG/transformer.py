@@ -103,7 +103,69 @@ class Transformer(nn.Module):
         
         vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
 
-        vid_mem = vid_fuse.transpose(0, 1)
+        vid_mem = vid_fuse.clone().transpose(0, 1)
+        memory_global = vid_mem.mean(1)
+        proj1_result = saliency_proj1(vid_mem)
+        proj2_result = saliency_proj2(memory_global)
+        proj2_result = proj2_result.unsqueeze(1)
+
+        intermediate_result = proj1_result * proj2_result
+        saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(d)
+
+        return vid_fuse, mask, pos_embed, attn_weights, saliency_scores
+
+class Transformer_Cross(nn.Module):
+    def __init__(self, d_model=512, nhead=8, num_encoder_layers=3,
+                 dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False,
+                 args=None
+                 ):
+        super().__init__()
+        self.args = args
+
+        # Adaptive Cross-Attention
+        t2v_encoder_layer = T2V_TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before, self.args.num_dummies)
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before)
+        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        self.d_model = d_model
+        self.nhead = nhead
+        self.cross_encoder_layer = nn.ModuleList(t2v_encoder_layer, encoder_layer)
+        self.cross_encoder = TransformerEncoder(self.cross_encoder_layer, num_encoder_layers, encoder_norm)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                # nn.init.xavier_uniform_(p)
+                nn.init.trunc_normal_(p, std=.02)
+
+    def forward(self, src, mask, pos_embed, video_length=None, saliency_proj1=None, saliency_proj2=None):
+        """
+        Args:
+            src: (batch_size, L, d)
+            mask: (batch_size, L)
+            query_embed: (#queries, d)
+            pos_embed: (batch_size, L, d) the same as src
+            video length: feature shape
+            vlen: actual video length
+        Returns:
+        """
+        # flatten NxCxHxW to HWxNxC
+        bs, l, d = src.shape 
+        src = src.permute(1, 0, 2)  # (L, batch_size, d)
+        pos_embed = pos_embed.permute(1, 0, 2)   # (L, batch_size, d)
+
+        t2v_src, attn_weights = self.t2v_encoder(src, src_key_padding_mask=mask, pos=pos_embed, video_length=video_length)
+
+        vid_fuse = t2v_src[:video_length]
+        mask = mask[:, :video_length]
+        pos_embed = pos_embed[:video_length]
+        
+        vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
+
+        vid_mem = vid_fuse.clone().transpose(0, 1)
         memory_global = vid_mem.mean(1)
         proj1_result = saliency_proj1(vid_mem)
         proj2_result = saliency_proj2(memory_global)
@@ -297,13 +359,12 @@ class T2V_TransformerEncoderLayer(nn.Module):
         # print(q.shape, k.shape, v.shape, attn_mask.shape, src_key_padding_mask[:, video_length + 1:].shape)
         src2, attn_weights = self.self_attn(q, k, v, attn_mask=attn_mask,
                                             key_padding_mask=src_key_padding_mask[:, video_length:], dummy=dummy)
-
+    
         src2 = src[:video_length] + self.dropout1(src2)
         src3 = self.norm1(src2)
         src3 = self.linear2(self.dropout(self.activation(self.linear1(src3))))
         src2 = src2 + self.dropout2(src3)
         src2 = self.norm2(src2)
-
         src = torch.cat([src2, src[video_length:]])
         return src, attn_weights
 

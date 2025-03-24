@@ -1,0 +1,17 @@
+{"time":"2025-03-24T15:45:12.341336364+09:00","level":"INFO","msg":"using version","core version":"0.18.7"}
+{"time":"2025-03-24T15:45:12.341356503+09:00","level":"INFO","msg":"created symlink","path":"/SSD1/minseok/MR_HD/FlashVTG/wandb/run-20250324_154512-r7kohmsl/logs/debug-core.log"}
+{"time":"2025-03-24T15:45:12.448219293+09:00","level":"INFO","msg":"created new stream","id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:12.448244983+09:00","level":"INFO","msg":"stream: started","id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:12.448281143+09:00","level":"INFO","msg":"sender: started","stream_id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:12.448281904+09:00","level":"INFO","msg":"writer: Do: started","stream_id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:12.448297715+09:00","level":"INFO","msg":"handler: started","stream_id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:12.903900951+09:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-03-24T15:45:13.570949561+09:00","level":"INFO","msg":"stream: closing","id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:13.570984519+09:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-03-24T15:45:13.571561677+09:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-03-24T15:45:23.001842778+09:00","level":"INFO","msg":"tensorboard: no root directory after 10 seconds, using working directory"}
+{"time":"2025-03-24T15:45:24.529526546+09:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-03-24T15:45:24.758871193+09:00","level":"INFO","msg":"handler: closed","stream_id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:24.758895761+09:00","level":"INFO","msg":"writer: Close: closed","stream_id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:24.758900641+09:00","level":"INFO","msg":"sender: closed","stream_id":"r7kohmsl"}
+{"time":"2025-03-24T15:45:24.75899347+09:00","level":"INFO","msg":"stream: closed","id":"r7kohmsl"}

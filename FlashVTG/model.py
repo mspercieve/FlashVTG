@@ -331,7 +331,7 @@ class SetCriterion(nn.Module):
         self.SampledNCELoss = SampledNCELoss().to(self.args.device)
         from nncore.nn import build_loss
         self.loss=build_loss(args.cfg.model.loss_cfg)
-    
+
     def norm(self, x):
         x = (x - x.min()) / (x.max() - x.min())
         return x

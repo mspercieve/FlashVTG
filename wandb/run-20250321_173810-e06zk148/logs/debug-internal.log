@@ -1,0 +1,8 @@
+{"time":"2025-03-21T17:38:10.638043239+09:00","level":"INFO","msg":"using version","core version":"0.18.7"}
+{"time":"2025-03-21T17:38:10.638068778+09:00","level":"INFO","msg":"created symlink","path":"/SSD1/minseok/MR_HD/FlashVTG/wandb/run-20250321_173810-e06zk148/logs/debug-core.log"}
+{"time":"2025-03-21T17:38:10.745456327+09:00","level":"INFO","msg":"created new stream","id":"e06zk148"}
+{"time":"2025-03-21T17:38:10.745487226+09:00","level":"INFO","msg":"stream: started","id":"e06zk148"}
+{"time":"2025-03-21T17:38:10.745522964+09:00","level":"INFO","msg":"writer: Do: started","stream_id":"e06zk148"}
+{"time":"2025-03-21T17:38:10.745543434+09:00","level":"INFO","msg":"handler: started","stream_id":"e06zk148"}
+{"time":"2025-03-21T17:38:10.74558341+09:00","level":"INFO","msg":"sender: started","stream_id":"e06zk148"}
+{"time":"2025-03-21T17:38:11.198168896+09:00","level":"INFO","msg":"Starting system monitor"}

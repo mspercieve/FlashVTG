@@ -386,7 +386,7 @@ def start_training():
     )
     dataset_config["data_path"] = opt.train_path
     train_dataset = StartEndDataset(**dataset_config)
-
+    torch.autograd.set_detect_anomaly(True)
     if opt.eval_path is not None:
         dataset_config["data_path"] = opt.eval_path
         dataset_config["txt_drop_ratio"] = 0
