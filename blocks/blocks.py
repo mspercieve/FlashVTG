@@ -25,6 +25,11 @@ class ConvPyramid(nn.Module):
 
         self.blocks = nn.ModuleList()
         for s in strides:
+            pre_conv = nn.Sequential(
+                Permute(),  # [B, L, 2*dims] -> [B, 2*dims, L]
+                nn.Conv1d(2 * dims, dims, kernel_size=1),
+                Permute()   # [B, 2*dims, L] -> [B, L, dims]
+            )
             p = int(math.log2(s))
             if p == 0:
                 layers = nn.ReLU(inplace=True)
@@ -39,8 +44,9 @@ class ConvPyramid(nn.Module):
                         nn.LayerNorm(dims),
                         nn.ReLU(inplace=True)
                     ])
+            block = nn.Sequential(pre_conv, layers)
+            #self.blocks.append(block)
             self.blocks.append(layers)
-
         self.strides = strides
 
     def forward(self, x, mask, return_mask=False):

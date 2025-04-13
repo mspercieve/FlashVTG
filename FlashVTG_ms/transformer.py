@@ -79,7 +79,7 @@ class Transformer(nn.Module):
                 # nn.init.xavier_uniform_(p)
                 nn.init.trunc_normal_(p, std=.02)
 
-    def forward(self, src, mask, pos_embed, video_length=None, saliency_proj1=None, saliency_proj2=None):
+    def forward(self, src, mask, pos_embed, video_length=None):
         """
         Args:
             src: (batch_size, L, d)
@@ -102,16 +102,7 @@ class Transformer(nn.Module):
         
         vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
 
-        vid_mem = vid_fuse.clone().transpose(0, 1)
-        memory_global = vid_mem.mean(1)
-        proj1_result = saliency_proj1(vid_mem)
-        proj2_result = saliency_proj2(memory_global)
-        proj2_result = proj2_result.unsqueeze(1)
-
-        intermediate_result = proj1_result * proj2_result
-        saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(d)
-
-        return vid_fuse, mask, pos_embed, attn_weights, saliency_scores
+        return vid_fuse, mask, pos_embed, attn_weights
 
 class TransformerCross(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=3,
@@ -514,7 +505,7 @@ def _get_clones(module, N):
 
 
 def build_transformer(args):
-    return TransformerCross(
+    return Transformer(
         d_model=args.hidden_dim,
         dropout=args.dropout,
         nhead=args.nheads,

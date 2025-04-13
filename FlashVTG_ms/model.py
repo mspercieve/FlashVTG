@@ -5,12 +5,13 @@ FlashVTG model and criterion classes.
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+import numpy as np
 from FlashVTG_ms.transformer import build_transformer, TransformerEncoderLayer, TransformerEncoder
 from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbeddingSine
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
+from LGI import Phrase_Generate, PhraseWeight, Phrase_Context, CrossAttention, AttentivePooling, Aggregate_Module
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -103,6 +104,12 @@ class FlashVTG_ms(nn.Module):
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
+        self.input_word_proj = nn.Sequential(*[
+            LinearLayer(txt_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
+            LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
+            LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
+        ][:n_input_proj])
+
         self.input_vid_proj = nn.Sequential(*[
             LinearLayer(vid_dim + aud_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
@@ -124,7 +131,6 @@ class FlashVTG_ms(nn.Module):
         self.pyramid = build_adapter(pyramid_cfg, hidden_dim, strides)
 
         self.pooling = build_adapter(pooling_cfg, hidden_dim)
-        self.conf_head = ConfidenceScorer(in_channels=256, out_channels=256, kernel_size=(1, args.kernel_size), num_conv_layers=args.num_conv_layers, num_mlp_layers = args.num_mlp_layers)
         self.class_head = ConfidenceScorer(in_channels=256, out_channels=256, kernel_size=(1, args.kernel_size), num_conv_layers=args.num_conv_layers, num_mlp_layers = args.num_mlp_layers)
         self.coef = nn.Parameter(torch.ones(len(strides)))
         self.coord_head = build_adapter(coord_head_cfg, hidden_dim, 2)
@@ -132,9 +138,18 @@ class FlashVTG_ms(nn.Module):
         self.max_num_moment = max_num_moment
         self.merge_cls_sal = merge_cls_sal
         self.args = args
+        self.num_phrase = args.num_phrase
         self.x = nn.Parameter(torch.tensor(0.5))
 
-
+        # build phrase embedding
+        self.phrase_generate = Phrase_Generate(args.num_phrase, hidden_dim, args.nheads, args.dropout, args.phrase_layers)
+        self.phrase_weight = PhraseWeight()
+        self.phrase_context = Phrase_Context(hidden_dim, args.nheads, args.dropout, args.context_layers)
+        self.context_norm = nn.LayerNorm(hidden_dim)
+        self.context_norm_neg = nn.LayerNorm(hidden_dim)
+        self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
+        self.attentive_pool = AttentivePooling(hidden_dim)
+        self.agg = Aggregate_Module(hidden_dim, args.dropout)
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
             _count = [v.count('_') for v in vid]
@@ -145,25 +160,39 @@ class FlashVTG_ms(nn.Module):
                 ori_vid = [v for v in vid]
 
         # Project inputs to the same hidden dimension
+        src_glob, src_word = torch.split(src_txt, [1, src_txt.size(1)-1], dim=1)
         src_vid = self.input_vid_proj(src_vid)
-        src_txt = self.input_txt_proj(src_txt)
+        src_glob = self.input_txt_proj(src_glob)
+        src_word = self.input_word_proj(src_word)
+        src_txt = torch.cat([src_glob, src_word], dim=1)  # [B, N, C]
         # Add type embeddings
         src_vid = src_vid + self.token_type_embeddings(torch.full_like(src_vid_mask.long(), 1))
         src_txt = src_txt + self.token_type_embeddings(torch.zeros_like(src_txt_mask.long()))
         # Add position embeddings
         pos_vid = self.position_embed(src_vid, src_vid_mask)
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
+        # separate sentence and word
+        _, src_word_msk = torch.split(src_txt_mask, [1, src_txt_mask.size(1)-1], dim=1)
+        pos_glob, pos_word = torch.split(pos_txt, [1, pos_txt.size(1)-1], dim=1)
 
-        # Insert dummy token in front of txt 
+        # Phrase Generate
+        phrase_emb, phrase_att = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
+        # key phrase score
+        phrase_score = self.phrase_weight(phrase_emb, src_vid, src_vid_mask) # [B, N]
+        phrase_score = phrase_score.unsqueeze(2).unsqueeze(3) # [B, N, 1, 1]
+        context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
+        context_emb = (context_emb * phrase_score).sum(1) # [B, T, C]
+        context_emb = self.context_norm(context_emb)
+
+        # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
-        src_txt_dummy = torch.cat([txt_dummy, src_txt], dim=1)
+        src_txt_dummy = torch.cat([txt_dummy, src_glob], dim=1)
 
 
-        mask_txt = torch.tensor([[True] * self.args.num_dummies]).to(src_txt_mask.device).repeat(src_txt_mask.shape[0], 1)
-        src_txt_mask_dummy = torch.cat([mask_txt, src_txt_mask], dim=1)
+        src_txt_mask_dummy = torch.tensor([[True] * (self.args.num_dummies + 1)]).to(src_txt_mask.device).repeat(src_txt_mask.shape[0], 1)
 
         pos_dummy = self.dummy_rep_pos.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(pos_txt.shape[0], 1, 1)
-        pos_txt_dummy = torch.cat([pos_dummy, pos_txt], dim=1)
+        pos_txt_dummy = torch.cat([pos_dummy, pos_glob], dim=1)
         src_txt_dummy = src_txt_dummy.permute(1, 0, 2) # (L, batch_size, d)
         pos_txt_dummy = pos_txt_dummy.permute(1, 0, 2) # (L, batch_size, d)
 
@@ -171,9 +200,8 @@ class FlashVTG_ms(nn.Module):
         dummy_token = memory[:self.args.num_dummies].permute(1, 0, 2)
         pos_txt_dummy = pos_txt_dummy.permute(1, 0, 2)
 
-        src_txt_dummy = torch.cat([dummy_token, src_txt], dim=1)
-        mask_txt_dummy = torch.tensor([[True] * self.args.num_dummies]).to(src_txt_mask.device).repeat(src_txt_mask.shape[0], 1)
-        src_txt_mask_dummy = torch.cat([mask_txt_dummy, src_txt_mask], dim=1)
+        src_txt_dummy = torch.cat([dummy_token, src_glob], dim=1)
+        src_txt_mask_dummy = torch.tensor([[True] * (self.args.num_dummies + 1)]).to(src_txt_mask.device).repeat(src_txt_mask.shape[0], 1)
 
         src = torch.cat([src_vid, src_txt_dummy], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask_dummy], dim=1).bool()  # (bsz, L_vid+L_txt)
@@ -181,10 +209,22 @@ class FlashVTG_ms(nn.Module):
 
         video_length = src_vid.shape[1]
 
-        video_emb, video_msk, pos_embed, attn_weights, saliency_scores = self.transformer(src, ~mask, pos, video_length=video_length, saliency_proj1=self.saliency_proj1, saliency_proj2=self.saliency_proj2)
+        # global text update
+        vid_fuse, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
+        glob_emb = vid_fuse.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
 
+        # concat with context & compute saliency score
+        video_emb = glob_emb
+        # video_emb = self.agg(glob_emb, context_emb)
 
-        video_emb = video_emb.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
+        video_emb_for_sal = video_emb.clone()
+        memory_global = video_emb_for_sal.mean(1)
+
+        proj1_result = self.saliency_proj1(video_emb_for_sal)
+        proj2_result = self.saliency_proj2(memory_global).unsqueeze(1)
+        intermediate_result = proj1_result * proj2_result  # (bsz, L, d)
+        saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(self.hidden_dim)  # (bsz, L)
+
         video_msk = (~video_msk).int()
         pymid, pymid_msk = self.pyramid(
             video_emb, video_msk, return_mask=self.training == True
@@ -193,14 +233,11 @@ class FlashVTG_ms(nn.Module):
 
         with torch.autocast("cuda", enabled=False):
             video_emb = video_emb.float()
-            query_emb = self.pooling(src_txt.float(), src_txt_mask)
+            query_emb = src_glob.float()
+            #query_emb = self.pooling(src_txt.float(), src_txt_mask)
             
             out_class = [self.class_head(e.float()) for e in pymid]
             out_class = torch.cat(out_class, dim=1)
-            out_conf = torch.cat(pymid, dim=1)
-            out_conf = self.conf_head(out_conf)
-            out_class = self.x*out_class+(1-self.x)*out_conf
-
             if self.coord_head is not None:
                 out_coord = [
                     self.coord_head(e.float()).exp() * self.coef[i]
@@ -208,14 +245,14 @@ class FlashVTG_ms(nn.Module):
                 ]
                 out_coord = torch.cat(out_coord, dim=1)
             else:
-                out_coord = None
+                out_coord = None 
 
             bs, t = src_vid.shape[0], src_vid.shape[1]
             output = dict(_avg_factor=bs)
             output["saliency_scores"] = saliency_scores
             output["t2vattnvalues"] = (attn_weights[:,:,self.args.num_dummies:] * (src_txt_mask.unsqueeze(1).repeat(1, video_length, 1))).sum(2)
             output["t2vattnvalues"] = torch.clamp(output["t2vattnvalues"], 0, 1)
-
+            output["sqan_att"] = phrase_att
             if self.training == True:
 
                 output["point"] = point
@@ -272,7 +309,16 @@ class FlashVTG_ms(nn.Module):
             real_neg_mask = torch.Tensor(element_wise_list_equal(ori_vid, neg_vid)).to(src_txt_dummy.device)
             real_neg_mask = real_neg_mask == False
             if real_neg_mask.sum() != 0:
-
+                # phrase neg
+                phrase_emb_neg = torch.cat([phrase_emb[1:], phrase_emb[0:1]], dim=0)
+                src_vid_neg = src_vid[real_neg_mask]
+                vid_mask_neg = src_vid_mask[real_neg_mask]
+                phrase_emb_neg = phrase_emb_neg[real_neg_mask]
+                phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N]
+                context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
+                context_emb_neg = (context_emb_neg * phrase_score_neg.unsqueeze(2).unsqueeze(3)).sum(1) # [B, T, C]
+                context_emb_neg = self.context_norm_neg(context_emb_neg)
+                # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
                 src_txt_mask_dummy_neg = torch.cat([src_txt_mask_dummy[1:], src_txt_mask_dummy[0:1]], dim=0)
                 src_dummy_neg = torch.cat([src_vid, src_txt_dummy_neg], dim=1)
@@ -284,7 +330,17 @@ class FlashVTG_ms(nn.Module):
                 pos_neg = pos_neg[real_neg_mask]
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
                 
-                memory_neg, video_msk, pos_embed, attn_weights_neg, saliency_scores_neg = self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length, saliency_proj1=self.saliency_proj1, saliency_proj2=self.saliency_proj2)
+                memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
+                memory_neg = memory_neg.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
+                vid_mem_neg = memory_neg
+                #vid_mem_neg = self.agg(memory_neg, context_emb_neg)
+                memory_global_neg = vid_mem_neg.mean(1).clone()
+                proj1_result_neg = self.saliency_proj1(vid_mem_neg)
+                proj2_result_neg = self.saliency_proj2(memory_global_neg)
+                proj2_result_neg = proj2_result_neg.unsqueeze(1)
+
+                intermediate_result_neg = proj1_result_neg * proj2_result_neg
+                saliency_scores_neg = torch.sum(intermediate_result_neg, dim=-1) / np.sqrt(self.hidden_dim)
 
                 output["saliency_scores_neg"] = saliency_scores_neg
                 output["src_txt_mask_neg"] = src_txt_mask_dummy_neg
@@ -336,6 +392,19 @@ class SetCriterion(nn.Module):
     def norm(self, x):
         x = (x - x.min()) / (x.max() - x.min())
         return x
+
+    def loss_phrase(self, outputs, targets, r=0.3, log=True):
+        self.r = r
+        attw = outputs["sqan_att"] # [B,num_att,N]
+        NA = attw.size(1)
+
+        attw_T = torch.transpose(attw, 1, 2).contiguous()
+
+        I = torch.eye(NA).unsqueeze(0).type_as(attw) * self.r
+        P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
+        da_loss = (P**2).mean()
+
+        return {"loss_phrase": da_loss}
 
     def loss_labels(self, outputs, targets, log=True):
         sal_score = targets["saliency_all_labels"]
@@ -647,6 +716,7 @@ class SetCriterion(nn.Module):
         loss_map = {
             "labels": self.loss_labels,
             "saliency": self.loss_saliency,
+            "phrase": self.loss_phrase,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
 
@@ -737,13 +807,13 @@ class SampledNCELoss(nn.Module):
         loss_msk = (saliency <= pos_scores) * video_msk
 
         scale = self.scale.exp().clamp(max=self.max_scale)
-        i_sim = F.cosine_similarity(video_emb, query_emb, dim=-1) * scale
+        i_sim = F.cosine_similarity(video_emb, query_emb, dim=-1) * scale # (B, T)
         i_sim = i_sim + torch.where(loss_msk > 0, .0, float('-inf'))
 
         loss = 0
 
         if 'row' in self.direction:
-            i_met = F.log_softmax(i_sim, dim=1)[batch_inds, pos_clip]
+            i_met = F.log_softmax(i_sim, dim=1)[batch_inds, pos_clip] 
             loss = loss - i_met.sum() / i_met.size(0)
 
         if 'col' in self.direction:
@@ -813,15 +883,17 @@ def build_model1(args):
         args=args
     )
 
-    weight_dict = {"loss_label": args.label_loss_coef,
+    weight_dict = {#"loss_label": args.label_loss_coef,
+                    "loss_label": 0,
                    "loss_saliency": args.lw_saliency,
                    'loss_reg': args.lw_reg,
                    "loss_cls": args.lw_cls,
                    "loss_sal": args.lw_sal,
+                   "loss_phrase": args.lw_phrase,
                    }
 
-    losses = ["saliency", 'labels']
-
+    losses = ["saliency", 'labels', 'phrase']
+    #losses = ["labels", "phrase"]
     criterion = SetCriterion(
         weight_dict=weight_dict, losses=losses,
         eos_coef=args.eos_coef, saliency_margin=args.saliency_margin, args=args

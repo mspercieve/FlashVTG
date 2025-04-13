@@ -130,6 +130,10 @@ class BaseOptions(object):
         parser.add_argument('--pre_norm', action='store_true')
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
         parser.add_argument("--temperature", type=float, default=0.07, help="temperature nce contrastive_align_loss")
+        # LGI
+        parser.add_argument("--num_phrase", type=int, default=3, help="number of phrases")
+        parser.add_argument("--phrase_layers", type=int, default=2, help="number of phrase layers")
+        parser.add_argument("--context_layers", type=int, default=2, help="number of context layers")
         # Loss
         parser.add_argument("--saliency_margin", type=float, default=0.2)
         parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
@@ -137,6 +141,8 @@ class BaseOptions(object):
         parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce'],
                             help="l1: (center-x, width) regression. ce: (st_idx, ed_idx) classification.")
         parser.add_argument('--sample_radius', default=1.5, type=float)
+        parser.add_argument("--lw_phrase", type=float, default=1,
+                            help="weight for phrase loss, set to 0 will ignore")
         parser.add_argument("--lw_reg", type=float, default=0.2,
                             help="weight for span loss, set to 0 will ignore")
         parser.add_argument("--lw_cls", type=float, default=1.,

@@ -34,14 +34,14 @@ fi
 bsz=64
 max_v_l=75
 max_q_l=40
-eval_epoch=1
+eval_epoch=3
 weight_decay=0.0001
 eval_bsz=1
 
 enc_layers=3
 t2v_layers=6
 dummy_layers=2
-num_dummies=10
+num_dummies=3
 kernel_size=5
 num_conv_layers=1
 num_mlp_layers=5
