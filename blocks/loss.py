@@ -7,6 +7,135 @@ import torch.nn as nn
 import torch.nn.functional as F
 from nncore.nn import LOSSES, Parameter, build_loss
 
+import torch.nn as nn
+import torch.nn.functional as F
+from .utils import weight_reduce_loss
+
+def quality_focal_loss(
+    pred,       # (B, N)
+    label,      # (B, N), 0 or 1
+    score,      # (B, N), quality (IoU)
+    weight=None,
+    beta=2.0,
+    reduction='mean',
+    avg_factor=None
+):
+    pred_sigmoid = pred.sigmoid()
+    zerolabel = pred.new_zeros(pred.shape)
+
+    # 기본 loss: BCE * pt^beta
+    loss = F.binary_cross_entropy_with_logits(pred, zerolabel, reduction='none') * pred_sigmoid.pow(beta)
+    # positive index (label == 1)
+    pos_mask = label > 0
+    if pos_mask.sum() > 0:
+        # overwrite positive loss
+        pos_pred = pred[pos_mask]
+        pos_score = score[pos_mask]
+        pos_pred_sigmoid = pred_sigmoid[pos_mask]
+
+        pt = torch.abs(pos_score - pos_pred_sigmoid)  # closer → lower loss
+        loss[pos_mask] = F.binary_cross_entropy_with_logits(pos_pred, pos_score, reduction='none') * pt.pow(beta)
+
+    loss = weight_reduce_loss(loss, weight, reduction, avg_factor)
+    return loss
+
+
+def distribution_focal_loss(
+        pred,          # [B, N, C]
+        label,         # [B, N] (float, continuous target)
+        weight=None,
+        reduction='mean',
+        avg_factor=None):
+    
+    B, N, C = pred.shape
+
+    disl = label.long()           # [B, N]
+    disr = disl + 1               # [B, N]
+
+    wl = disr.float() - label     # [B, N]
+    wr = label - disl.float()     # [B, N]
+
+    # 3. Flatten
+    pred_flat = pred.view(-1, C)      # [B*N, C]
+    disl_flat = disl.view(-1)         # [B*N]
+    disr_flat = disr.view(-1)         # [B*N]
+    wl_flat = wl.view(-1)             # [B*N]
+    wr_flat = wr.view(-1)             # [B*N]
+
+    # 4. Cross-entropy loss for left and right bins
+    loss = F.cross_entropy(pred_flat, disl_flat, reduction='none') * wl_flat + \
+           F.cross_entropy(pred_flat, disr_flat, reduction='none') * wr_flat
+
+    loss = loss.view(B, N)
+    loss = weight_reduce_loss(loss, weight, reduction, avg_factor)
+    return loss
+
+@LOSSES.register()
+class QualityFocalLoss(nn.Module):
+
+    def __init__(self,
+                 use_sigmoid=True,
+                 beta=2.0,
+                 reduction='mean',
+                 loss_weight=1.0):
+        super(QualityFocalLoss, self).__init__()
+        assert use_sigmoid is True, 'Only sigmoid in QFL supported now.'
+        self.use_sigmoid = use_sigmoid
+        self.beta = beta
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+
+    def forward(self,
+                pred,
+                target,
+                score,
+                weight=None,
+                avg_factor=None,
+                reduction_override=None):
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+        if self.use_sigmoid:
+            loss_cls = self.loss_weight * quality_focal_loss(
+                pred,
+                target,
+                score,
+                weight,
+                beta=self.beta,
+                reduction=reduction,
+                avg_factor=avg_factor)
+        else:
+            raise NotImplementedError
+        return loss_cls
+
+
+@LOSSES.register()
+class DistributionFocalLoss(nn.Module):
+
+    def __init__(self,
+                 reduction='mean',
+                 loss_weight=1.0):
+        super(DistributionFocalLoss, self).__init__()
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+
+    def forward(self,
+                pred,
+                target,
+                weight=None,
+                avg_factor=None,
+                reduction_override=None):
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+        loss_cls = self.loss_weight * distribution_focal_loss(
+            pred,
+            target,
+            weight,
+            reduction=reduction,
+            avg_factor=avg_factor)
+        return loss_cls
+
 
 @LOSSES.register()
 class SampledNCELoss(nn.Module):
@@ -70,13 +199,16 @@ class BundleLoss(nn.Module):
                  loss_cls=None,
                  loss_reg=None,
                  loss_sal=None,
+                 loss_qfl=None,
+                 loss_dfl=None,
                  ):
         super(BundleLoss, self).__init__()
 
         self._loss_cls = build_loss(loss_cls)
         self._loss_reg = build_loss(loss_reg)
         self._loss_sal = build_loss(loss_sal)
-
+        self._loss_qfl = build_loss(loss_qfl)
+        self._loss_dfl = build_loss(loss_dfl)
         self.sample_radius = sample_radius
 
     def get_target_single(self, point, gt_bnd, gt_cls):
@@ -115,7 +247,6 @@ class BundleLoss(nn.Module):
         label = F.one_hot(gt_cls[:, 0], 2).to(r_tgt.dtype)
         c_tgt = torch.matmul(min_len_mask, label).clamp(min=0.0, max=1.0)[:, 1]
         r_tgt = r_tgt[range(num_pts), min_len_inds] / point[:, 3, None]
-
         return c_tgt, r_tgt
 
     def get_target(self, data):
@@ -135,8 +266,71 @@ class BundleLoss(nn.Module):
 
         return cls_tgt, reg_tgt
 
+    def get_iou(self, point, reg_pred, reg_tgt):
+        """
+        Args:
+            point:    [N, 4], 마지막 dim은 (center, min_reg, max_reg, stride)
+            reg_tgt:  [B, N, 2], regression target (offsets to GT boundaries)
+
+        Returns:
+            iou_targets: [B, N]
+        """
+        # [N] → [1, N] → broadcast to [B, N]
+        center = point[:, 0][None, :]         # [1, N]
+        stride = point[:, 3][None, :]         # [1, N]
+
+        # predicted box
+        pred_start = center - reg_pred[:, :, 0] * stride
+        pred_end   = center + reg_pred[:, :, 1] * stride
+
+        # GT box (reconstructed same way)
+        gt_start = center - reg_tgt[:, :, 0] * stride
+        gt_end   = center + reg_tgt[:, :, 1] * stride
+
+        # intersection and union
+        inter_left  = torch.max(pred_start, gt_start)
+        inter_right = torch.min(pred_end, gt_end)
+        inter = (inter_right - inter_left).clamp(min=0)
+
+        union_left  = torch.min(pred_start, gt_start)
+        union_right = torch.max(pred_end, gt_end)
+        union = (union_right - union_left).clamp(min=1e-6)
+
+        iou = inter / union  # [B, N]
+        return iou
+
+    def loss_qfl(self, data, output, cls_tgt, reg_tgt):
+        src = data['out_class'].squeeze(-1)
+        reg_pred = data['out_coord']
+        msk = torch.cat(data['pymid_msk'], dim=1)
+        score = self.get_iou(data['point'], reg_pred, reg_tgt)
+        loss_qfl = self._loss_qfl(src, cls_tgt, score =score, weight=msk, avg_factor=msk.sum())
+
+        output['loss_qfl'] = loss_qfl
+        return output
+    
+    def loss_dfl(self, data, output, reg_tgt):
+        src = data['out_coord']
+        msk = torch.cat(data['pymid_msk'], dim=1)
+
+        #dfl for start index
+        src_s = src[:, :, 0]
+        reg_tgt_s = reg_tgt[:, :, 0]
+        loss_dfl_s = self._loss_dfl(src_s, reg_tgt_s, weight=msk, avg_factor=msk.sum())
+
+        #dfl for end index
+        src_e = src[:, :, 1]
+        reg_tgt_e = reg_tgt[:, :, 1]
+        loss_dfl_e = self._loss_dfl(src_e, reg_tgt_e, weight=msk, avg_factor=msk.sum())
+
+        loss_dfl = loss_dfl_s + loss_dfl_e
+        output['loss_dfl'] = loss_dfl
+        return loss_dfl
+
+
     def loss_cls(self, data, output, cls_tgt):
         src = data['out_class'].squeeze(-1)
+        print(src[0])
         msk = torch.cat(data['pymid_msk'], dim=1)
         loss_cls = self._loss_cls(src, cls_tgt, weight=msk, avg_factor=msk.sum())
 
@@ -176,5 +370,12 @@ class BundleLoss(nn.Module):
 
         if self._loss_sal is not None:
             output = self.loss_sal(data, output)
+
+        if self._loss_qfl is not None:
+            cls_tgt, reg_tgt = self.get_target(data)
+            output = self.loss_qfl(data, output, cls_tgt, reg_tgt)
+        
+        if self._loss_dfl is not None:
+            output = self.loss_dfl(data, output, reg_tgt)
 
         return output

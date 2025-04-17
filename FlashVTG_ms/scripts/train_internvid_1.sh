@@ -53,7 +53,8 @@ lw_saliency=0.8
 label_loss_coef=4
 
 PYTHONPATH=$PYTHONPATH:. python FlashVTG_ms/train.py \
-data/MR.py \
+data/MR_GFL.py \
+--sample_radius 2 \
 --dset_name ${dset_name} \
 --ctx_mode ${ctx_mode} \
 --train_path ${train_path} \

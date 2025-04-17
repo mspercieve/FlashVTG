@@ -55,13 +55,16 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
         targets["fps"] = torch.full((256,), 1/opt.clip_length).to(opt.device) # if datasets is qv, fps is 0.5
         outputs = model(**model_inputs, targets=targets)
 
-        loss_dict = criterion(batch, outputs, targets)
-        loss_dict = {k: v for k, v in outputs.items() if 'loss' in k}
+        loss_dict = criterion(batch, epoch_i, outputs, targets)
+        #loss_dict = {k: v for k, v in outputs.items() if 'loss' in k}
+
+        
 
         weight_dict = criterion.weight_dict
         losses = sum(
             loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict
         )
+
 
         if torch.isnan(losses).any():
             print("Loss contains NaN values")

@@ -133,7 +133,10 @@ class FlashVTG_ms(nn.Module):
         self.pooling = build_adapter(pooling_cfg, hidden_dim)
         self.class_head = ConfidenceScorer(in_channels=256, out_channels=256, kernel_size=(1, args.kernel_size), num_conv_layers=args.num_conv_layers, num_mlp_layers = args.num_mlp_layers)
         self.coef = nn.Parameter(torch.ones(len(strides)))
-        self.coord_head = build_adapter(coord_head_cfg, hidden_dim, 2)
+        if args.use_dfl:
+            self.coord_head = build_adapter(coord_head_cfg, hidden_dim, args.num_bins * 2)
+        else:
+            self.coord_head = build_adapter(coord_head_cfg, hidden_dim, 2)
         self.generator = PointGenerator(strides, buffer_size)
         self.max_num_moment = max_num_moment
         self.merge_cls_sal = merge_cls_sal
@@ -150,6 +153,7 @@ class FlashVTG_ms(nn.Module):
         self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
         self.attentive_pool = AttentivePooling(hidden_dim)
         self.agg = Aggregate_Module(hidden_dim, args.dropout)
+
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
             _count = [v.count('_') for v in vid]
@@ -262,9 +266,9 @@ class FlashVTG_ms(nn.Module):
                 output["pymid_msk"] = pymid_msk
                 output["out_class"] = out_class
                 output["out_coord"] = out_coord 
-                
+                '''
                 boundarys = []
-                out_class = out_class.sigmoid()
+                out_class = out_class.sigmoid() # [bs, (1+1/2+1/4+1/8)L, 1]
                 for idx, boundary in enumerate(out_coord):
                     boundary = boundary.clone()
 
@@ -280,7 +284,7 @@ class FlashVTG_ms(nn.Module):
 
                 boundarys = torch.stack(boundarys, dim=0)
                 output["pred_spans"] = boundarys
-
+                '''
 
             if self.training == False:
                 assert bs == 1, "batch size larger than 1 is not supported for inference"
@@ -290,7 +294,7 @@ class FlashVTG_ms(nn.Module):
                 output["_out"]["video_msk"] = video_msk
                 output["_out"]["saliency"] = saliency_scores[0]
 
-                if self.coord_head is not None:
+                if  self.args.use_dfl==False and self.coord_head is not None:
                     boundary = out_coord[0]
                     boundary[:, 0] *= -1
                     boundary *= point[:, 3, None].repeat(1, 2)
@@ -302,7 +306,33 @@ class FlashVTG_ms(nn.Module):
                     boundary = boundary[inds[: self.max_num_moment]]  
 
                     output["_out"]["boundary"] = boundary
-        
+
+                elif self.args.use_dfl and self.coord_head is not None:
+                    boundary = out_coord[0]  # shape: (N, num_bins * 2)
+                    num_bins = self.args.num_bins
+                    bin_size = self.args.sample_radius / (num_bins - 1)
+
+                    start_logits = boundary[:, :num_bins]     # (N, num_bins)
+                    end_logits = boundary[:, num_bins:]       # (N, num_bins)
+
+                    start_prob = F.softmax(start_logits, dim=-1)  # (N, num_bins)
+                    end_prob = F.softmax(end_logits, dim=-1)      # (N, num_bins)
+
+                    bin_centers = torch.linspace(0, self.args.sample_radius, steps=num_bins, device=boundary.device)  # (num_bins,)
+
+                    start = torch.sum(start_prob * bin_centers[None, :], dim=-1)  # (N,)
+                    end = torch.sum(end_prob * bin_centers[None, :], dim=-1)      # (N,)
+                    boundary = torch.stack([start, end], dim=-1)  # (N, 2)
+                    boundary[:, 0] *= -1
+                    boundary = boundary * point[:, 3, None].repeat(1, 2)
+                    boundary = boundary + point[:, 0, None].repeat(1, 2)
+                    boundary = boundary / (1 / self.args.clip_length)
+
+                    boundary = torch.cat((boundary, out_class[0]), dim=-1)
+                    _, inds = out_class[0, :, 0].sort(descending=True)
+                    boundary = boundary[inds[: self.max_num_moment]]
+                    output["_out"]["boundary"] = boundary
+
         if self.training == True and self.args.use_neg:
             ### Neg Pairs ###
             neg_vid = ori_vid[1:] + ori_vid[:1] 
@@ -360,402 +390,6 @@ class FlashVTG_ms(nn.Module):
 
         return output
 
-class SetCriterion(nn.Module):
-    """ This class computes the loss."""
-
-    def __init__(self, weight_dict, eos_coef, losses, saliency_margin=1, args=None):
-        """ Create the criterion."""
-        super().__init__()
-        self.args=args
-        self.weight_dict = weight_dict
-        self.losses = losses
-        self.saliency_margin = saliency_margin
-        self.device = args.device
-
-        # foreground and background classification
-        self.foreground_label = 0
-        self.background_label = 1
-
-        self.eos_coef = eos_coef
-        empty_weight = torch.ones(2)
-        empty_weight[-1] = self.eos_coef  # lower weight for background (index 1, foreground index 0)
-        self.register_buffer('empty_weight', empty_weight)
-        
-        self.criterion = torch.nn.CrossEntropyLoss().to(self.args.device)
-        self.l2_criterion = torch.nn.MSELoss().to(self.args.device)
-        self.kld_criterion = torch.nn.KLDivLoss(reduction='none').to(self.args.device)
-        self.bce_criterion = nn.BCELoss(reduction='none')
-        self.SampledNCELoss = SampledNCELoss().to(self.args.device)
-        from nncore.nn import build_loss
-        self.loss=build_loss(args.cfg.model.loss_cfg)
-
-    def norm(self, x):
-        x = (x - x.min()) / (x.max() - x.min())
-        return x
-
-    def loss_phrase(self, outputs, targets, r=0.3, log=True):
-        self.r = r
-        attw = outputs["sqan_att"] # [B,num_att,N]
-        NA = attw.size(1)
-
-        attw_T = torch.transpose(attw, 1, 2).contiguous()
-
-        I = torch.eye(NA).unsqueeze(0).type_as(attw) * self.r
-        P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
-        da_loss = (P**2).mean()
-
-        return {"loss_phrase": da_loss}
-
-    def loss_labels(self, outputs, targets, log=True):
-        sal_score = targets["saliency_all_labels"]
-        conf = outputs["out_class"][:, :sal_score.shape[1], 0]
-
-        norm_sal_score = self.norm(sal_score)
-        norm_conf = self.norm(conf)
-        losses = F.mse_loss(norm_sal_score, norm_conf)
-        return {"loss_label": losses}
-
-    def loss_saliency(self, outputs, targets, log=True):
-        """higher scores for positive clips"""
-        if "saliency_pos_labels" not in targets:
-            return {"loss_saliency": 0}
-
-        # Neg pair loss
-        if outputs["saliency_scores_neg"] is not None: ## When batch size is not 1 (negative pair exists)
-            vid_token_mask = outputs["video_msk"]
-            real_neg_mask = outputs["real_neg_mask"]
-            saliency_scores_neg = outputs["saliency_scores_neg"].clone()  # (N, L)
-            loss_neg_pair = (- torch.log(1. - torch.sigmoid(saliency_scores_neg)) * (vid_token_mask[real_neg_mask])).sum(dim=1).mean()
-
-            saliency_scores = outputs["saliency_scores"].clone()  # (N, L)
-            saliency_contrast_label = targets["saliency_all_labels"]
-
-            # real neg
-            realneg_saliency_scores = torch.cat([saliency_scores[real_neg_mask], saliency_scores_neg], dim=1)
-            realneg_saliency_contrast_label = torch.cat([saliency_contrast_label[real_neg_mask], torch.zeros_like(saliency_contrast_label)[real_neg_mask]], dim=1)
-            realneg_vid_token_mask = vid_token_mask[real_neg_mask].repeat([1, 2])
-            realneg_saliency_scores = realneg_vid_token_mask * realneg_saliency_scores + (1. - realneg_vid_token_mask) * -1e+3
-
-            tau = 0.5
-            loss_rank_contrastive = 0.
-            for rand_idx in range(1, 12):
-                drop_mask = ~(realneg_saliency_contrast_label > 100)  # no drop
-                pos_mask = (realneg_saliency_contrast_label >= rand_idx)  # positive when equal or higher than rand_idx
-                if torch.sum(pos_mask) == 0:  # no positive sample
-                    continue
-                else:
-                    batch_drop_mask = torch.sum(pos_mask, dim=1) > 0  # negative sample indicator
-
-                # drop higher ranks
-                cur_saliency_scores = realneg_saliency_scores * drop_mask / tau + ~drop_mask * -1e+3
-                # numerical stability
-                logits = cur_saliency_scores - torch.max(cur_saliency_scores, dim=1, keepdim=True)[0]
-                # softmax
-                exp_logits = torch.exp(logits)
-                log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-
-                mean_log_prob_pos = (pos_mask * log_prob * realneg_vid_token_mask).sum(1) / (pos_mask.sum(1) + 1e-6)
-                loss = - mean_log_prob_pos * batch_drop_mask
-                loss_rank_contrastive = loss_rank_contrastive + loss.mean()
-            loss_rank_contrastive = loss_rank_contrastive / 12
-
-            false_neg_mask = ~(real_neg_mask)
-            if false_neg_mask.sum() != 0:
-                if false_neg_mask.sum() == 1:
-                    falseneg_saliency_scores = saliency_scores[false_neg_mask].unsqueeze(0)
-                    falseneg_saliency_contrast_label = saliency_contrast_label[false_neg_mask].unsqueeze(0)
-                    falseneg_vid_token_mask = vid_token_mask[false_neg_mask].unsqueeze(0)
-                    falseneg_saliency_scores = falseneg_vid_token_mask * falseneg_saliency_scores + (1. - falseneg_vid_token_mask) * -1e+3
-                else:
-                    falseneg_saliency_scores = saliency_scores[false_neg_mask]
-                    falseneg_saliency_contrast_label = saliency_contrast_label[false_neg_mask]
-                    falseneg_vid_token_mask = vid_token_mask[false_neg_mask]
-                    falseneg_saliency_scores = falseneg_vid_token_mask * falseneg_saliency_scores + (1. - falseneg_vid_token_mask) * -1e+3
-
-                tau = 0.5
-                falseneg_loss_rank_contrastive = 0.
-                for rand_idx in range(1, 12):
-                    drop_mask = ~(falseneg_saliency_contrast_label > 100)  # no drop
-                    pos_mask = (falseneg_saliency_contrast_label >= rand_idx)  # positive when equal or higher than rand_idx
-                    if torch.sum(pos_mask) == 0:  # no positive sample
-                        continue
-                    else:
-                        batch_drop_mask = torch.sum(pos_mask, dim=1) > 0  # negative sample indicator
-
-                    # drop higher ranks
-                    cur_saliency_scores = falseneg_saliency_scores * drop_mask / tau + ~drop_mask * -1e+3
-                    # numerical stability
-                    logits = cur_saliency_scores - torch.max(cur_saliency_scores, dim=1, keepdim=True)[0]
-                    # softmax
-                    exp_logits = torch.exp(logits)
-                    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-
-                    mean_log_prob_pos = (pos_mask * log_prob * falseneg_vid_token_mask).sum(1) / (pos_mask.sum(1) + 1e-6)
-                    loss = - mean_log_prob_pos * batch_drop_mask
-                    falseneg_loss_rank_contrastive = falseneg_loss_rank_contrastive + loss.mean()
-                falseneg_loss_rank_contrastive = falseneg_loss_rank_contrastive / 12
-                loss_rank_contrastive += falseneg_loss_rank_contrastive
-
-            saliency_scores = outputs["saliency_scores"]  # (N, L)
-            pos_indices = targets["saliency_pos_labels"]  # (N, #pairs)
-            neg_indices = targets["saliency_neg_labels"]  # (N, #pairs)
-            num_pairs = pos_indices.shape[1]  # typically 2 or 4
-            batch_indices = torch.arange(len(saliency_scores)).to(saliency_scores.device)
-            pos_scores = torch.stack(
-                [saliency_scores[batch_indices, pos_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            neg_scores = torch.stack(
-                [saliency_scores[batch_indices, neg_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            loss_saliency = torch.clamp(self.saliency_margin + neg_scores - pos_scores, min=0).sum() \
-                            / (len(pos_scores) * num_pairs) * 2  # * 2 to keep the loss the same scale
-
-            if self.args.dset_name in ['youtube_uni']:
-                loss_saliency = loss_saliency + loss_rank_contrastive + loss_neg_pair * 0.
-            else:
-                loss_saliency = loss_saliency + loss_rank_contrastive + loss_neg_pair
-                
-            ########### Saliency loss to t2v attn weights ##############
-            """higher scores for positive clips"""
-            vid_token_mask = outputs["video_msk"]
-            # Neg pair loss
-
-            if outputs["t2vattnvalues_neg"] is not None:
-                saliency_scores_neg = outputs["t2vattnvalues_neg"].clone()  # (N, L)
-                loss_neg_pair_attn = (- torch.log(1. - saliency_scores_neg) * (vid_token_mask[real_neg_mask])).sum(dim=1).mean()
-
-            saliency_scores = outputs["t2vattnvalues"].clone()  # (N, L)
-            saliency_contrast_label = targets["saliency_all_labels"]
-
-            # real neg
-            realneg_saliency_scores = torch.cat([saliency_scores[real_neg_mask], saliency_scores_neg], dim=1)
-            realneg_saliency_contrast_label = torch.cat(
-                [saliency_contrast_label[real_neg_mask], torch.zeros_like(saliency_contrast_label)[real_neg_mask]], dim=1)
-            realneg_vid_token_mask = vid_token_mask[real_neg_mask].repeat([1, 2])
-            realneg_saliency_scores = realneg_vid_token_mask * realneg_saliency_scores + (
-                        1. - realneg_vid_token_mask) * -1e+3
-
-            tau = 0.5
-            loss_rank_contrastive_attn = 0.
-            for rand_idx in range(1, 12):
-                drop_mask = ~(realneg_saliency_contrast_label > 100)  # no drop
-                pos_mask = (realneg_saliency_contrast_label >= rand_idx)  # positive when equal or higher than rand_idx
-                if torch.sum(pos_mask) == 0:  # no positive sample
-                    continue
-                else:
-                    batch_drop_mask = torch.sum(pos_mask, dim=1) > 0  # negative sample indicator
-
-                # drop higher ranks
-                cur_saliency_scores = realneg_saliency_scores * drop_mask / tau + ~drop_mask * -1e+3
-                # numerical stability
-                logits = cur_saliency_scores - torch.max(cur_saliency_scores, dim=1, keepdim=True)[0]
-                # softmax
-                exp_logits = torch.exp(logits)
-                log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-
-                mean_log_prob_pos = (pos_mask * log_prob * realneg_vid_token_mask).sum(1) / (pos_mask.sum(1) + 1e-6)
-                loss = - mean_log_prob_pos * batch_drop_mask
-                loss_rank_contrastive_attn = loss_rank_contrastive_attn + loss.mean()
-            loss_rank_contrastive_attn = loss_rank_contrastive_attn / 12
-
-            false_neg_mask = ~(real_neg_mask)
-            if false_neg_mask.sum() != 0:
-                if false_neg_mask.sum() == 1:
-                    falseneg_saliency_scores = saliency_scores[false_neg_mask].unsqueeze(0)
-                    falseneg_saliency_contrast_label = saliency_contrast_label[false_neg_mask].unsqueeze(0)
-                    falseneg_vid_token_mask = vid_token_mask[false_neg_mask].unsqueeze(0)
-                    falseneg_saliency_scores = falseneg_vid_token_mask * falseneg_saliency_scores + (1. - falseneg_vid_token_mask) * -1e+3
-                else:
-                    falseneg_saliency_scores = saliency_scores[false_neg_mask]
-                    falseneg_saliency_contrast_label = saliency_contrast_label[false_neg_mask]
-                    falseneg_vid_token_mask = vid_token_mask[false_neg_mask]
-                    falseneg_saliency_scores = falseneg_vid_token_mask * falseneg_saliency_scores + (1. - falseneg_vid_token_mask) * -1e+3
-
-                tau = 0.5
-                falseneg_loss_rank_contrastive = 0.
-                for rand_idx in range(1, 12):
-                    drop_mask = ~(falseneg_saliency_contrast_label > 100)  # no drop
-                    pos_mask = (falseneg_saliency_contrast_label >= rand_idx)  # positive when equal or higher than rand_idx
-                    if torch.sum(pos_mask) == 0:  # no positive sample
-                        continue
-                    else:
-                        batch_drop_mask = torch.sum(pos_mask, dim=1) > 0  # negative sample indicator
-
-                    # drop higher ranks
-                    cur_saliency_scores = falseneg_saliency_scores * drop_mask / tau + ~drop_mask * -1e+3
-                    # numerical stability
-                    logits = cur_saliency_scores - torch.max(cur_saliency_scores, dim=1, keepdim=True)[0]
-                    # softmax
-                    exp_logits = torch.exp(logits)
-                    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-
-                    mean_log_prob_pos = (pos_mask * log_prob * falseneg_vid_token_mask).sum(1) / (pos_mask.sum(1) + 1e-6)
-                    loss = - mean_log_prob_pos * batch_drop_mask
-                    falseneg_loss_rank_contrastive = falseneg_loss_rank_contrastive + loss.mean()
-                falseneg_loss_rank_contrastive = falseneg_loss_rank_contrastive / 12
-                loss_rank_contrastive += falseneg_loss_rank_contrastive
-
-            saliency_scores = outputs["t2vattnvalues"]  # (N, L)
-            pos_indices = targets["saliency_pos_labels"]  # (N, #pairs)
-            neg_indices = targets["saliency_neg_labels"]  # (N, #pairs)
-            num_pairs = pos_indices.shape[1]  # typically 2 or 4
-            batch_indices = torch.arange(len(saliency_scores)).to(saliency_scores.device)
-            pos_scores = torch.stack(
-                [saliency_scores[batch_indices, pos_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            neg_scores = torch.stack(
-                [saliency_scores[batch_indices, neg_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            loss_saliency_attn = torch.clamp(self.saliency_margin + neg_scores - pos_scores, min=0).sum() \
-                            / (len(pos_scores) * num_pairs) * 2  # * 2 to keep the loss the same scale
-
-            saliency_binary_label = torch.clamp(targets["saliency_all_labels"], 0, 1)
-            logits = saliency_scores.reshape(-1)
-            labels_x = saliency_binary_label.reshape(-1)
-            BCEcriterion = nn.BCELoss()
-            bceloss = BCEcriterion(logits, labels_x)
-
-            if self.args.dset_name in ['youtube_uni']:
-                loss_saliency_attn = loss_rank_contrastive_attn + bceloss + loss_neg_pair_attn * 0 + loss_saliency_attn
-            else:
-                loss_saliency_attn = loss_rank_contrastive_attn + bceloss + loss_neg_pair_attn + loss_saliency_attn
-            loss_saliency = loss_saliency + (loss_saliency_attn * self.args.lw_wattn)
-            
-        else: ## when batch size == 1
-            vid_token_mask = outputs["video_msk"]
-            saliency_scores = outputs["saliency_scores"].clone()  # (N, L)
-            saliency_contrast_label = targets["saliency_all_labels"]
-
-            saliency_scores = vid_token_mask * saliency_scores + (1. - vid_token_mask) * -1e+3
-
-            tau = 0.5
-            loss_rank_contrastive = 0.
-            for rand_idx in range(1, 12):
-                drop_mask = ~(saliency_contrast_label > 100)  # no drop
-                pos_mask = (saliency_contrast_label >= rand_idx)  # positive when equal or higher than rand_idx
-                if torch.sum(pos_mask) == 0:  # no positive sample
-                    continue
-                else:
-                    batch_drop_mask = torch.sum(pos_mask, dim=1) > 0  # negative sample indicator
-
-                # drop higher ranks
-                cur_saliency_scores = saliency_scores * drop_mask / tau + ~drop_mask * -1e+3
-                # numerical stability
-                logits = cur_saliency_scores - torch.max(cur_saliency_scores, dim=1, keepdim=True)[0]
-                # softmax
-                exp_logits = torch.exp(logits)
-                log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-
-                mean_log_prob_pos = (pos_mask * log_prob * vid_token_mask).sum(1) / (pos_mask.sum(1) + 1e-6)
-                loss = - mean_log_prob_pos * batch_drop_mask
-                loss_rank_contrastive = loss_rank_contrastive + loss.mean()
-            loss_rank_contrastive = loss_rank_contrastive / 12
-
-            saliency_scores = outputs["saliency_scores"]  # (N, L)
-            pos_indices = targets["saliency_pos_labels"]  # (N, #pairs)
-            neg_indices = targets["saliency_neg_labels"]  # (N, #pairs)
-            num_pairs = pos_indices.shape[1]  # typically 2 or 4
-            batch_indices = torch.arange(len(saliency_scores)).to(saliency_scores.device)
-            pos_scores = torch.stack(
-                [saliency_scores[batch_indices, pos_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            neg_scores = torch.stack(
-                [saliency_scores[batch_indices, neg_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            loss_saliency = torch.clamp(self.saliency_margin + neg_scores - pos_scores, min=0).sum() \
-                            / (len(pos_scores) * num_pairs) * 2  # * 2 to keep the loss the same scale
-
-            loss_saliency = loss_saliency + loss_rank_contrastive
-            ########### Saliency loss to t2v attn weights ##############
-            """higher scores for positive clips"""
-            vid_token_mask = outputs["video_msk"]
-            saliency_scores = outputs["t2vattnvalues"].clone()  # (N, L)
-            saliency_contrast_label = targets["saliency_all_labels"]
-
-            saliency_scores = vid_token_mask * saliency_scores + (1. - vid_token_mask) * -1e+3
-
-            tau = 0.5
-            loss_rank_contrastive = 0.
-            for rand_idx in range(1, 12):
-                drop_mask = ~(saliency_contrast_label > 100)  # no drop
-                pos_mask = (saliency_contrast_label >= rand_idx)  # positive when equal or higher than rand_idx
-                if torch.sum(pos_mask) == 0:  # no positive sample
-                    continue
-                else:
-                    batch_drop_mask = torch.sum(pos_mask, dim=1) > 0  # negative sample indicator
-
-                # drop higher ranks
-                cur_saliency_scores = saliency_scores * drop_mask / tau + ~drop_mask * -1e+3
-                # numerical stability
-                logits = cur_saliency_scores - torch.max(cur_saliency_scores, dim=1, keepdim=True)[0]
-                # softmax
-                exp_logits = torch.exp(logits)
-                log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-
-                mean_log_prob_pos = (pos_mask * log_prob * vid_token_mask).sum(1) / (pos_mask.sum(1) + 1e-6)
-                loss = - mean_log_prob_pos * batch_drop_mask
-                loss_rank_contrastive = loss_rank_contrastive + loss.mean()
-            loss_rank_contrastive_attn = loss_rank_contrastive / 12
-
-            saliency_scores = outputs["t2vattnvalues"]  # (N, L)
-            pos_indices = targets["saliency_pos_labels"]  # (N, #pairs)
-            neg_indices = targets["saliency_neg_labels"]  # (N, #pairs)
-            num_pairs = pos_indices.shape[1]  # typically 2 or 4
-            batch_indices = torch.arange(len(saliency_scores)).to(saliency_scores.device)
-            pos_scores = torch.stack(
-                [saliency_scores[batch_indices, pos_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            neg_scores = torch.stack(
-                [saliency_scores[batch_indices, neg_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
-            loss_saliency_attn = torch.clamp(self.saliency_margin + neg_scores - pos_scores, min=0).sum() \
-                            / (len(pos_scores) * num_pairs) * 2  # * 2 to keep the loss the same scale
-            saliency_binary_label = torch.clamp(targets["saliency_all_labels"], 0, 1)
-            logits = saliency_scores.reshape(-1)
-            labels_x = saliency_binary_label.reshape(-1)
-            BCEcriterion = nn.BCELoss()
-            bceloss = BCEcriterion(logits, labels_x)
-
-            loss_saliency_attn = loss_rank_contrastive_attn + bceloss + loss_saliency_attn 
-            loss_saliency += (loss_saliency_attn * self.args.lw_wattn)
-        return {"loss_saliency": loss_saliency}
-
-    def get_loss(self, loss, outputs, targets, **kwargs):
-        loss_map = {
-            "labels": self.loss_labels,
-            "saliency": self.loss_saliency,
-            "phrase": self.loss_phrase,
-        }
-        assert loss in loss_map, f'do you really want to compute {loss} loss?'
-
-        return loss_map[loss](outputs, targets, **kwargs)
-
-    def extract_relevant_windows(self, data_list):
-        all_windows = [instance['relevant_windows'] for instance in data_list]
-        max_len = max(len(windows) for windows in all_windows)
-
-        padded_windows = []
-        for windows in all_windows:
-            new_windows = windows.copy()  
-            while len(new_windows) < max_len:
-                new_windows.append([float('inf'), float('inf')])
-            padded_windows.append(new_windows)
-        
-        result_tensor = torch.tensor(padded_windows, dtype=torch.float32)
-        
-        return result_tensor
-
-    def forward(self, batch, outputs, targets):
-        """ This performs the loss computation."""
-        losses = {}
-        new_outputs = {}
-        new_outputs["boundary"] = self.extract_relevant_windows(batch[0]).to(self.device) if batch[0][0]['relevant_windows'] != None else None
-        new_outputs["saliency"] = targets["saliency_all_labels"]
-        new_outputs["pos_clip"] = targets["saliency_pos_labels"][:, 0].unsqueeze(1)
-        new_outputs["label"] = batch[0]
-        new_outputs["fps"] = targets["fps"]
-        new_outputs.update(outputs)
-
-        losses = self.loss(new_outputs, outputs)
-
-        # Compute all the requested losses
-        for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets))
-
-        return losses
-
 class Parameter(nn.Parameter):
     """
     An :obj:`nn.Parameter` class that supports multiple inputs initializes the
@@ -773,6 +407,7 @@ class Parameter(nn.Parameter):
             data = torch.randn(args, **kwargs) / args[-1]**0.5
 
         return torch.Tensor._make_subclass(cls, data, requires_grad)
+
 
 class SampledNCELoss(nn.Module):
 
@@ -890,10 +525,12 @@ def build_model1(args):
                    "loss_cls": args.lw_cls,
                    "loss_sal": args.lw_sal,
                    "loss_phrase": args.lw_phrase,
+                   "loss_qfl": 0,
                    }
 
-    losses = ["saliency", 'labels', 'phrase']
+    losses = ["saliency", 'labels', 'phrase', 'sal', 'reg', 'cls', 'qfl']
     #losses = ["labels", "phrase"]
+    from FlashVTG_ms.loss import SetCriterion
     criterion = SetCriterion(
         weight_dict=weight_dict, losses=losses,
         eos_coef=args.eos_coef, saliency_margin=args.saliency_margin, args=args
