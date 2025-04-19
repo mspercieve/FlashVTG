@@ -614,12 +614,12 @@ class SetCriterion(nn.Module):
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets))
 
-        '''
-        self.update_weight_dict(self.args.tgt_epoch, curr_epoch, "loss_sal", 0.0)
-        self.update_weight_dict(self.args.tgt_epoch, curr_epoch, "loss_cls", 0.0)
-        self.update_weight_dict(self.args.tgt_epoch, curr_epoch, "loss_qfl", 1.0)
-        self.update_weight_dict(self.args.tgt_epoch, curr_epoch, "loss_label", 0.0)
-        '''
+        
+        #self.update_weight_dict(self.args.tgt_epoch, curr_epoch, "loss_sal", 0.0)
+        #self.update_weight_dict(30, curr_epoch, "loss_cls", 0.0)
+        #self.update_weight_dict(30, curr_epoch, "loss_qfl", self.args.lw_cls)
+        #self.update_weight_dict(30, curr_epoch, "loss_label", 0.0)
+        
         return losses
 
 class Parameter(nn.Parameter):

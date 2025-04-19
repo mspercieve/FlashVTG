@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
-sys.path.append('/SSD1/minseok/MR_HD/FlashVTG/utils/')
+sys.path.append('/SSD/minseok/FlashVTG/utils/')
 import net_utils
 import math
 from position_encoding import PositionEmbeddingSine
