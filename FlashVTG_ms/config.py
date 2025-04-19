@@ -143,7 +143,6 @@ class BaseOptions(object):
                             help="Disables auxiliary decoding losses (loss at each layer)")
         parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce'],
                             help="l1: (center-x, width) regression. ce: (st_idx, ed_idx) classification.")
-        parser.add_argument('--sample_radius', default=1.5, type=float)
         parser.add_argument("--lw_phrase", type=float, default=1,
                             help="weight for phrase loss, set to 0 will ignore")
         parser.add_argument("--lw_reg", type=float, default=0.2,

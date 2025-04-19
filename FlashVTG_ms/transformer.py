@@ -9,6 +9,7 @@ import math
 import numpy as np
 from .attention import MultiheadAttention
 from .crossattention import MultiheadAttention as cateattention
+from position_encoding import PositionEmbeddingSine
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -56,7 +57,7 @@ class Transformer(nn.Module):
                  ):
         super().__init__()
         self.args = args
-
+        self.pos_embed = PositionEmbeddingSine(args.hidden_dim * 2, normalize=True)
         # Adaptive Cross-Attention
         t2v_encoder_layer = T2V_TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before, self.args.num_dummies)
@@ -64,9 +65,9 @@ class Transformer(nn.Module):
         self.t2v_encoder = TransformerCATEEncoder(t2v_encoder_layer, args.t2v_layers, encoder_norm)
 
         ## Transformer Encoder
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+        encoder_layer = TransformerEncoderLayer(2 * d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
-        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        encoder_norm = nn.LayerNorm(2 * d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
         self._reset_parameters()
 
@@ -79,7 +80,7 @@ class Transformer(nn.Module):
                 # nn.init.xavier_uniform_(p)
                 nn.init.trunc_normal_(p, std=.02)
 
-    def forward(self, src, mask, pos_embed, video_length=None):
+    def forward(self, src, context_emb, mask, pos_embed, video_length=None):
         """
         Args:
             src: (batch_size, L, d)
@@ -98,9 +99,11 @@ class Transformer(nn.Module):
 
         vid_fuse = t2v_src[:video_length]
         mask = mask[:, :video_length]
-        pos_embed = pos_embed[:video_length]
         
-        vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
+        context_emb = context_emb.permute(1, 0, 2)  # (L, batch_size, d)
+        vid_fuse = torch.cat([vid_fuse, context_emb], dim=2)  # (L, batch_size, d)
+        vid_pos = self.pos_embed(vid_fuse, mask).permute(1,0,2)
+        vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=vid_pos)  # (L, batch_size, d)
 
         return vid_fuse, mask, pos_embed, attn_weights
 
