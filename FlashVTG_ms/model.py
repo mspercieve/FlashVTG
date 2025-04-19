@@ -146,13 +146,17 @@ class FlashVTG_ms(nn.Module):
 
         # build phrase embedding
         self.phrase_generate = Phrase_Generate(args.num_phrase, hidden_dim, args.nheads, args.dropout, args.phrase_layers)
-        self.phrase_weight = PhraseWeight()
+        self.phrase_weight = PhraseWeight(args.hidden_dim)
         self.phrase_context = Phrase_Context(hidden_dim, args.nheads, args.dropout, args.context_layers)
         self.context_norm = nn.LayerNorm(hidden_dim)
         self.context_norm_neg = nn.LayerNorm(hidden_dim)
         self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
         self.attentive_pool = AttentivePooling(hidden_dim)
         self.agg = Aggregate_Module(hidden_dim, args.dropout)
+        self.fuse_proj = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
@@ -166,6 +170,7 @@ class FlashVTG_ms(nn.Module):
         # Project inputs to the same hidden dimension
         src_glob, src_word = torch.split(src_txt, [1, src_txt.size(1)-1], dim=1)
         src_vid = self.input_vid_proj(src_vid)
+        B, T, C = src_vid.shape
         src_glob = self.input_txt_proj(src_glob)
         src_word = self.input_word_proj(src_word)
         src_txt = torch.cat([src_glob, src_word], dim=1)  # [B, N, C]
@@ -173,7 +178,8 @@ class FlashVTG_ms(nn.Module):
         src_vid = src_vid + self.token_type_embeddings(torch.full_like(src_vid_mask.long(), 1))
         src_txt = src_txt + self.token_type_embeddings(torch.zeros_like(src_txt_mask.long()))
         # Add position embeddings
-        pos_vid = self.position_embed(src_vid, src_vid_mask)
+
+        pos_vid = self.position_embed(torch.cat([src_vid, src_vid], dim=-1), src_vid_mask)
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
         # separate sentence and word
         _, src_word_msk = torch.split(src_txt_mask, [1, src_txt_mask.size(1)-1], dim=1)
@@ -182,11 +188,11 @@ class FlashVTG_ms(nn.Module):
         # Phrase Generate
         phrase_emb, phrase_att = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
         # key phrase score
-        phrase_score = self.phrase_weight(phrase_emb, src_vid, src_vid_mask) # [B, N]
-        phrase_score = phrase_score.unsqueeze(2).unsqueeze(3) # [B, N, 1, 1]
+        phrase_score = self.phrase_weight(phrase_emb, src_glob) # [B, N]
+        phrase_score = phrase_score.unsqueeze(-1).unsqueeze(-1)
         context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
-        context_emb = (context_emb * phrase_score).sum(1) # [B, T, C]
-        context_emb = self.context_norm(context_emb)
+        context_emb = (context_emb * phrase_score).sum(1).view(B,T,C) # [B,T,C]
+
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -214,11 +220,9 @@ class FlashVTG_ms(nn.Module):
         video_length = src_vid.shape[1]
 
         # global text update
-        vid_fuse, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
-        glob_emb = vid_fuse.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
-
-        # concat with context & compute saliency score
-        video_emb = glob_emb
+        vid_fuse, video_msk, pos_embed, attn_weights = self.transformer(src, context_emb, ~mask, pos, video_length=video_length)
+        vid_fuse = self.fuse_proj(vid_fuse) # 2d -> d
+        video_emb = vid_fuse.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
         # video_emb = self.agg(glob_emb, context_emb)
 
         video_emb_for_sal = video_emb.clone()
@@ -228,7 +232,6 @@ class FlashVTG_ms(nn.Module):
         proj2_result = self.saliency_proj2(memory_global).unsqueeze(1)
         intermediate_result = proj1_result * proj2_result  # (bsz, L, d)
         saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(self.hidden_dim)  # (bsz, L)
-
         video_msk = (~video_msk).int()
         pymid, pymid_msk = self.pyramid(
             video_emb, video_msk, return_mask=self.training == True
@@ -344,10 +347,13 @@ class FlashVTG_ms(nn.Module):
                 src_vid_neg = src_vid[real_neg_mask]
                 vid_mask_neg = src_vid_mask[real_neg_mask]
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
-                phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N]
+
+                src_glob_neg = torch.cat([src_glob[1:], src_glob[0:1]], dim=0)
+                phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_glob_neg[real_neg_mask]) # [B, N]
+                phrase_score_neg = phrase_score_neg.unsqueeze(-1).unsqueeze(-1)
+
                 context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
-                context_emb_neg = (context_emb_neg * phrase_score_neg.unsqueeze(2).unsqueeze(3)).sum(1) # [B, T, C]
-                context_emb_neg = self.context_norm_neg(context_emb_neg)
+                context_emb_neg = (context_emb_neg * phrase_score_neg).sum(1) # [B, T, C]
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
                 src_txt_mask_dummy_neg = torch.cat([src_txt_mask_dummy[1:], src_txt_mask_dummy[0:1]], dim=0)
@@ -360,18 +366,19 @@ class FlashVTG_ms(nn.Module):
                 pos_neg = pos_neg[real_neg_mask]
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
                 
-                memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
+                memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, context_emb_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 memory_neg = memory_neg.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
+                memory_neg = self.fuse_proj(memory_neg) # 2d -> d
                 vid_mem_neg = memory_neg
                 #vid_mem_neg = self.agg(memory_neg, context_emb_neg)
+                txt_glob_neg = torch.cat([src_glob[1:], src_glob[0:1]], dim=0)
                 memory_global_neg = vid_mem_neg.mean(1).clone()
                 proj1_result_neg = self.saliency_proj1(vid_mem_neg)
                 proj2_result_neg = self.saliency_proj2(memory_global_neg)
+                proj2_result_neg = self.saliency_proj2(txt_glob_neg[real_neg_mask].squeeze(1))
                 proj2_result_neg = proj2_result_neg.unsqueeze(1)
-
                 intermediate_result_neg = proj1_result_neg * proj2_result_neg
                 saliency_scores_neg = torch.sum(intermediate_result_neg, dim=-1) / np.sqrt(self.hidden_dim)
-
                 output["saliency_scores_neg"] = saliency_scores_neg
                 output["src_txt_mask_neg"] = src_txt_mask_dummy_neg
 

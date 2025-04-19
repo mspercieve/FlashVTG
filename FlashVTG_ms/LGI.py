@@ -203,13 +203,13 @@ class SlotAttention(nn.Module):
         phrase_slot = self.norm1(phrase_slot)
         return phrase_slot
 
-
+    '''
 class PhraseWeight(nn.Module):
     def __init__(self, temperature=1.0):
         super(PhraseWeight, self).__init__()
         self.tau = temperature
-    def forward(self, phrase_slot, vid_feat, vid_mask):
 
+    def forward(self, phrase_slot, vid_feat, vid_mask):
     # Compute attention weights
         dot_product = torch.einsum('btc,bnc->btn', vid_feat, phrase_slot) # [B, T, N]
         empty_vid_mask = ~(vid_mask.bool()).unsqueeze(-1)
@@ -220,35 +220,43 @@ class PhraseWeight(nn.Module):
         # Apply temperature-scaled softmax
         softmax_output = F.softmax(masked_dot_product / self.tau, dim=2)
         keyphrase_weight = torch.max(softmax_output, dim=2)[0]
-        return keyphrase_weight
 
+        
+        return keyphrase_weight
+    '''
+
+class PhraseWeight(nn.Module):
+    def __init__(self, hdim):
+        super(PhraseWeight, self).__init__()
+        self.q = nn.Linear(hdim, hdim)
+        self.k = nn.Linear(hdim, hdim)
+    def forward(self, phrase_slot, eos_emb):
+        # Compute attention weights
+        c = phrase_slot.shape[2]
+        eos_q = self.q(eos_emb) # [B, 1, C]
+        phrase_k = self.k(phrase_slot) # [B, N, C]
+        dot_product = torch.einsum('blc,bnc->bln', eos_q, phrase_k) # [B, 1 N]
+        # Apply temperature-scaled softmax
+        softmax_output = F.softmax(dot_product / math.sqrt(c), dim=2)
+        return softmax_output.squeeze(1) # [B, N]
+    
 class PhraseContextLayer(nn.Module):
     def __init__(self, hdim, nheads, dropout=0.1):
         super(PhraseContextLayer, self).__init__()
-        self.t_att = SelfAttention(hdim, nheads, dropout=dropout)
         self.n_att = SelfAttention(hdim, nheads, dropout=dropout)
         self.linear = nn.Linear(hdim, hdim)
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hdim)
-        
-    def forward(self, context_emb, context_mask, B, N, T, C):
-        # context_emb: [B*N, T, C] -> T self attention
-        context_emb, attn_t = self.t_att(context_emb, context_mask)  # [B*N, T, C]
-        # reshape: from [B*N, T, C] to [B, N, T, C] then permute to [B, T, N, C]
-        context_emb = context_emb.view(B, N, T, C).permute(0, 2, 1, 3).contiguous()
-        # merge B and T: [B, T, N, C] -> [B*T, N, C]
-        context_emb = context_emb.view(B*T, N, C)
-        
-        context_emb, attn_n = self.n_att(context_emb, None)
-        # reshape: [B*T, N, C] -> [B, T, N, C] -> permute to [B, N, T, C]
-        context_emb = context_emb.view(B, T, N, C).permute(0, 2, 1, 3).contiguous()
-        # reshape back to [B*N, T, C] for linear block
-        context_emb = context_emb.view(B*N, T, C)
-        
-        # linear block with residual connection
+        self.norm1 = nn.LayerNorm(hdim)
+    def forward(self, context_emb):
+        # N-axis self-attention
+        context_att, _ = self.n_att(context_emb, None) # [B*T,N,C]
+        context_emb = self.norm1(context_emb + context_att)
+        # feedforward with residual connection
         update = self.dropout(self.act(self.linear(context_emb)))
         context_emb = self.norm(context_emb + update)
+
         return context_emb
 
 class Phrase_Context(nn.Module):
@@ -257,7 +265,6 @@ class Phrase_Context(nn.Module):
         self.hdim = hdim
         self.num_layers = num_layers
         self.layers = nn.ModuleList([PhraseContextLayer(hdim, nheads, dropout) for _ in range(num_layers)])
-        self.pos = PositionEmbeddingSine(hdim, normalize=True)
         self.dropout = nn.Dropout(dropout)
 
         if product_idim_1 is None:
@@ -272,24 +279,18 @@ class Phrase_Context(nn.Module):
         Args:
             phrase_slot: [B, N, C] phrase slots
             vid_feat: [B, T, C] video-level features
-            vid_mask: [B, T] boolean mask for valid frames (True for valid)
         Returns:
-            updated_phrase: [B, N, T, C]
+            updated_phrase: [B, T, N, C]
         """
         B, T, C = vid_feat.shape
         N = phrase_slot.shape[1]
         
         context_emb = self.product([phrase_slot, vid_feat]) # [ B, N, T, C]
-        context_emb = context_emb.view(B*N, T, C) # [B*N, T, C]
-        context_mask = vid_mask.repeat_interleave(N, dim=0)
-        
-        # add positional encoding
-        context_pos = self.pos(context_emb, context_mask)
-        context_emb = context_emb + context_pos
-        
+        context_emb = context_emb.transpose(1, 2).contiguous().view(B*T, N, C) # [B*T, N, C]
+
         for layer in self.layers:
-            context_emb = layer(context_emb, context_mask, B, N, T, C)
-        updated_phrase = context_emb.view(B, N, T, C)
+            context_emb = layer(context_emb)
+        updated_phrase = context_emb.view(B, T, N, C).transpose(1, 2).contiguous() # [B, N, T, C]
         return updated_phrase
 
 class HadamardProduct(nn.Module):
@@ -300,6 +301,7 @@ class HadamardProduct(nn.Module):
         self.fc_2 = nn.Linear(idim_2, hdim)
         self.fc_3 = nn.Linear(hdim, hdim)
         self.norm = nn.LayerNorm(hdim)
+        self.norm1 = nn.LayerNorm(hdim)
     def forward(self, inp):
         """
         Args:
@@ -310,7 +312,7 @@ class HadamardProduct(nn.Module):
         x1 = torch.relu(self.fc_1(x1)).unsqueeze(2) # [B, N, 1, hdim]
         x2 = torch.relu(self.fc_2(x2)).unsqueeze(1) # [B, 1, T, hdim]
         x = self.norm(x1 * x2) # [B, N, T, hdim]
-        return torch.relu(self.fc_3(x))
+        return torch.relu(self.norm1(self.fc_3(x))) # [B, N, T, hdim]
     
 class SelfAttention(nn.Module):
     def __init__(self, hdim, nheads, dropout=0.1):
