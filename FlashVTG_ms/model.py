@@ -221,14 +221,11 @@ class FlashVTG_ms(nn.Module):
 
         # global text update
         vid_fuse, video_msk, pos_embed, attn_weights = self.transformer(src, context_emb, ~mask, pos, video_length=video_length)
-        vid_fuse = self.fuse_proj(vid_fuse) # 2d -> d
         video_emb = vid_fuse.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
         # video_emb = self.agg(glob_emb, context_emb)
+        memory_global = video_emb.mean(1)
 
-        video_emb_for_sal = video_emb.clone()
-        memory_global = video_emb_for_sal.mean(1)
-
-        proj1_result = self.saliency_proj1(video_emb_for_sal)
+        proj1_result = self.saliency_proj1(video_emb)
         proj2_result = self.saliency_proj2(memory_global).unsqueeze(1)
         intermediate_result = proj1_result * proj2_result  # (bsz, L, d)
         saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(self.hidden_dim)  # (bsz, L)
@@ -368,14 +365,12 @@ class FlashVTG_ms(nn.Module):
                 
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, context_emb_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 memory_neg = memory_neg.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
-                memory_neg = self.fuse_proj(memory_neg) # 2d -> d
                 vid_mem_neg = memory_neg
                 #vid_mem_neg = self.agg(memory_neg, context_emb_neg)
                 txt_glob_neg = torch.cat([src_glob[1:], src_glob[0:1]], dim=0)
                 memory_global_neg = vid_mem_neg.mean(1).clone()
                 proj1_result_neg = self.saliency_proj1(vid_mem_neg)
                 proj2_result_neg = self.saliency_proj2(memory_global_neg)
-                proj2_result_neg = self.saliency_proj2(txt_glob_neg[real_neg_mask].squeeze(1))
                 proj2_result_neg = proj2_result_neg.unsqueeze(1)
                 intermediate_result_neg = proj1_result_neg * proj2_result_neg
                 saliency_scores_neg = torch.sum(intermediate_result_neg, dim=-1) / np.sqrt(self.hidden_dim)

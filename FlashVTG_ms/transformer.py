@@ -69,6 +69,12 @@ class Transformer(nn.Module):
                                                 dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(2 * d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
+        self.fuse_proj = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
         self._reset_parameters()
 
         self.d_model = d_model
@@ -104,7 +110,7 @@ class Transformer(nn.Module):
         vid_fuse = torch.cat([vid_fuse, context_emb], dim=2)  # (L, batch_size, d)
         vid_pos = self.pos_embed(vid_fuse, mask).permute(1,0,2)
         vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=vid_pos)  # (L, batch_size, d)
-
+        vid_fuse = self.fuse_proj(vid_fuse)  # (L, batch_size, d)
         return vid_fuse, mask, pos_embed, attn_weights
 
 class TransformerCross(nn.Module):
