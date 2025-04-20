@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
-sys.path.append('/SSD/minseok/FlashVTG/utils/')
+sys.path.append('/SSD1/minseok/MR_HD/FlashVTG/utils/')
 import net_utils
 import math
 from position_encoding import PositionEmbeddingSine
@@ -411,31 +411,3 @@ class AttentivePooling(nn.Module):
         out = pooled.view(B, T, C)
         return out
     
-class Aggregate_Module(nn.Module):
-    def __init__(self, hdim, dropout=0.1):
-        super(Aggregate_Module, self).__init__()
-        self.linear = nn.Linear(2 * hdim, hdim)
-        self.linear1 = nn.Linear(hdim, hdim)
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(hdim)
-        self.norm1 = nn.LayerNorm(hdim)
-    
-    def forward(self, x, y):
-        """
-        Args:
-            x: [B, L, C]
-            y: [B, L, C]
-        """
-        assert x.shape == y.shape
-        B, L, C = x.shape
-        agg = torch.cat([x, y], dim=-1) # [B, L, 2*C]
-        agg = self.linear(agg)
-        agg = self.act(agg)
-        agg = self.dropout(agg)
-        agg = self.norm(agg)
-        agg = self.linear1(agg)
-        agg = self.act(agg)
-        agg = self.dropout(agg)
-        agg = self.norm1(agg)
-        return agg

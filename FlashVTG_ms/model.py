@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, PhraseWeight, Phrase_Context, CrossAttention, AttentivePooling, Aggregate_Module
+from LGI import Phrase_Generate, PhraseWeight, Phrase_Context, CrossAttention, AttentivePooling
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -152,11 +152,6 @@ class FlashVTG_ms(nn.Module):
         self.context_norm_neg = nn.LayerNorm(hidden_dim)
         self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
         self.attentive_pool = AttentivePooling(hidden_dim)
-        self.agg = Aggregate_Module(hidden_dim, args.dropout)
-        self.fuse_proj = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
@@ -220,23 +215,23 @@ class FlashVTG_ms(nn.Module):
         video_length = src_vid.shape[1]
 
         # global text update
-        vid_fuse, video_msk, pos_embed, attn_weights = self.transformer(src, context_emb, ~mask, pos, video_length=video_length)
-        video_emb = vid_fuse.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
+        vid_emb, vid_fuse, video_msk, pos_embed, attn_weights = self.transformer(src, context_emb, ~mask, pos, video_length=video_length)
+        src_emb = vid_fuse.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
         # video_emb = self.agg(glob_emb, context_emb)
-        memory_global = video_emb.mean(1)
+        memory_global = src_emb.clone().mean(1)
 
-        proj1_result = self.saliency_proj1(video_emb)
+        proj1_result = self.saliency_proj1(src_emb)
         proj2_result = self.saliency_proj2(memory_global).unsqueeze(1)
         intermediate_result = proj1_result * proj2_result  # (bsz, L, d)
         saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(self.hidden_dim)  # (bsz, L)
         video_msk = (~video_msk).int()
         pymid, pymid_msk = self.pyramid(
-            video_emb, video_msk, return_mask=self.training == True
+            src_emb, video_msk, return_mask=self.training == True
         )
         point = self.generator(pymid)
 
         with torch.autocast("cuda", enabled=False):
-            video_emb = video_emb.float()
+            video_emb = vid_emb.float()
             query_emb = src_glob.float()
             #query_emb = self.pooling(src_txt.float(), src_txt_mask)
             
@@ -363,7 +358,7 @@ class FlashVTG_ms(nn.Module):
                 pos_neg = pos_neg[real_neg_mask]
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
                 
-                memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, context_emb_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
+                _, memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, context_emb_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 memory_neg = memory_neg.permute(1, 0, 2)  # (L, batch_size, d) -> (batch_size, L, d)
                 vid_mem_neg = memory_neg
                 #vid_mem_neg = self.agg(memory_neg, context_emb_neg)

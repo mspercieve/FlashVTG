@@ -72,8 +72,6 @@ class Transformer(nn.Module):
         self.fuse_proj = nn.Sequential(
             nn.Linear(2 * d_model, d_model),
             nn.LayerNorm(d_model),
-            nn.ReLU(),
-            nn.Dropout(0.1),
         )
         self._reset_parameters()
 
@@ -103,15 +101,16 @@ class Transformer(nn.Module):
         pos_embed = pos_embed.permute(1, 0, 2)   # (L, batch_size, d)
         t2v_src, attn_weights = self.t2v_encoder(src, src_key_padding_mask=mask, pos=pos_embed, video_length=video_length)
 
-        vid_fuse = t2v_src[:video_length]
+        vid_emb = t2v_src[:video_length]
         mask = mask[:, :video_length]
         
         context_emb = context_emb.permute(1, 0, 2)  # (L, batch_size, d)
-        vid_fuse = torch.cat([vid_fuse, context_emb], dim=2)  # (L, batch_size, d)
+        vid_fuse = torch.cat([vid_emb, context_emb], dim=2)  # (L, batch_size, d)
         vid_pos = self.pos_embed(vid_fuse, mask).permute(1,0,2)
         vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=vid_pos)  # (L, batch_size, d)
         vid_fuse = self.fuse_proj(vid_fuse)  # (L, batch_size, d)
-        return vid_fuse, mask, pos_embed, attn_weights
+        vid_emb = vid_emb.permute(1, 0, 2)  # (batch_size, L, d)
+        return vid_emb, vid_fuse, mask, pos_embed, attn_weights
 
 class TransformerCross(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=3,
