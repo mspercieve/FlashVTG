@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, PhraseWeight, Phrase_Context, CrossAttention, AttentivePooling, Aggregate_Module
+from LGI import Phrase_Generate, PhraseWeight, Phrase_Context, CrossAttention, AttentivePooling
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -152,11 +152,7 @@ class FlashVTG_ms(nn.Module):
         self.context_norm_neg = nn.LayerNorm(hidden_dim)
         self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
         self.attentive_pool = AttentivePooling(hidden_dim)
-        self.agg = Aggregate_Module(hidden_dim, args.dropout)
-        self.fuse_proj = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
+
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:

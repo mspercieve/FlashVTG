@@ -55,6 +55,7 @@ label_loss_coef=4
 PYTHONPATH=$PYTHONPATH:. python FlashVTG_ms/train.py \
 data/MR.py \
 --num_bins 16 \
+--context_layers 0 \
 --dset_name ${dset_name} \
 --ctx_mode ${ctx_mode} \
 --train_path ${train_path} \
