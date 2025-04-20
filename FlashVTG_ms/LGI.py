@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
-sys.path.append('/SSD1/minseok/MR_HD/FlashVTG/utils/')
+sys.path.append('utils/')
 import net_utils
 import math
 from position_encoding import PositionEmbeddingSine
@@ -203,10 +203,10 @@ class SlotAttention(nn.Module):
         phrase_slot = self.norm1(phrase_slot)
         return phrase_slot
 
-    '''
-class PhraseWeight(nn.Module):
+    
+class PhraseWeight_vid(nn.Module):
     def __init__(self, temperature=1.0):
-        super(PhraseWeight, self).__init__()
+        super(PhraseWeight_vid, self).__init__()
         self.tau = temperature
 
     def forward(self, phrase_slot, vid_feat, vid_mask):
@@ -223,11 +223,11 @@ class PhraseWeight(nn.Module):
 
         
         return keyphrase_weight
-    '''
+    
 
-class PhraseWeight(nn.Module):
+class PhraseWeight_eos(nn.Module):
     def __init__(self, hdim):
-        super(PhraseWeight, self).__init__()
+        super(PhraseWeight_eos, self).__init__()
         self.q = nn.Linear(hdim, hdim)
         self.k = nn.Linear(hdim, hdim)
     def forward(self, phrase_slot, eos_emb):

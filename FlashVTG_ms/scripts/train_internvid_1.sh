@@ -11,7 +11,7 @@ eval_path=data/highlight_val_release.jsonl
 eval_split_name=val
 
 ######## setup video+text features
-feat_root='/SSD1/minseok/MR_HD/DB'
+feat_root='/SSD/minseok/DB/'
 
 # video features
 v_feat_dim=0
@@ -54,6 +54,7 @@ label_loss_coef=4
 
 PYTHONPATH=$PYTHONPATH:. python FlashVTG_ms/train.py \
 data/MR_GFL.py \
+--context_layers 0 \
 --dset_name ${dset_name} \
 --ctx_mode ${ctx_mode} \
 --train_path ${train_path} \

@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, PhraseWeight, Phrase_Context, CrossAttention, AttentivePooling
+from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, AttentivePooling
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -146,7 +146,8 @@ class FlashVTG_ms(nn.Module):
 
         # build phrase embedding
         self.phrase_generate = Phrase_Generate(args.num_phrase, hidden_dim, args.nheads, args.dropout, args.phrase_layers)
-        self.phrase_weight = PhraseWeight(args.hidden_dim)
+        #self.phrase_weight = PhraseWeight_eos(args.hidden_dim)
+        self.phrase_weight = PhraseWeight_vid()
         self.phrase_context = Phrase_Context(hidden_dim, args.nheads, args.dropout, args.context_layers)
         self.context_norm = nn.LayerNorm(hidden_dim)
         self.context_norm_neg = nn.LayerNorm(hidden_dim)
@@ -183,7 +184,8 @@ class FlashVTG_ms(nn.Module):
         # Phrase Generate
         phrase_emb, phrase_att = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
         # key phrase score
-        phrase_score = self.phrase_weight(phrase_emb, src_glob) # [B, N]
+        #phrase_score = self.phrase_weight(phrase_emb, src_glob) # [B, N]
+        phrase_score = self.phrase_weight(phrase_emb, src_vid, src_vid_mask) # [B, N]
         phrase_score = phrase_score.unsqueeze(-1).unsqueeze(-1)
         context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
         context_emb = (context_emb * phrase_score).sum(1).view(B,T,C) # [B,T,C]
@@ -341,7 +343,8 @@ class FlashVTG_ms(nn.Module):
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
 
                 src_glob_neg = torch.cat([src_glob[1:], src_glob[0:1]], dim=0)
-                phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_glob_neg[real_neg_mask]) # [B, N]
+                #phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_glob_neg[real_neg_mask]) # [B, N]
+                phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N]
                 phrase_score_neg = phrase_score_neg.unsqueeze(-1).unsqueeze(-1)
 
                 context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
