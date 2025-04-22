@@ -6,6 +6,7 @@ sys.path.append('utils/')
 import net_utils
 import math
 from position_encoding import PositionEmbeddingSine
+from einops import rearrange, repeat
 
 class Attention(nn.Module):
     def __init__(self, kdim, cdim, hdim, drop_p):
@@ -244,15 +245,23 @@ class PhraseContextLayer(nn.Module):
     def __init__(self, hdim, nheads, dropout=0.1):
         super(PhraseContextLayer, self).__init__()
         self.n_att = SelfAttention(hdim, nheads, dropout=dropout)
+        self.t_att = SelfAttention(hdim, nheads, dropout=dropout)
         self.linear = nn.Linear(hdim, hdim)
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hdim)
         self.norm1 = nn.LayerNorm(hdim)
-    def forward(self, context_emb):
+    def forward(self, context_emb, shape):
+        """
+        context_emb: [B*N, T, C]
+        """
+        B, N, T, C = shape
+        # T-axis self-attention
+        context_emb, _ = self.t_att(context_emb, None) # [B*N, T, C]
+        context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B*T, N, C]
         # N-axis self-attention
         context_att, _ = self.n_att(context_emb, None) # [B*T,N,C]
-        context_emb = self.norm1(context_emb + context_att)
+        context_emb = rearrange(context_att, '(b t) n c -> (b n) t c', b=B, n=N) # [B*N, T, C]
         # feedforward with residual connection
         update = self.dropout(self.act(self.linear(context_emb)))
         context_emb = self.norm(context_emb + update)
@@ -273,7 +282,7 @@ class Phrase_Context(nn.Module):
             product_idim_2 = hdim
 
         self.product = HadamardProduct(product_idim_1, product_idim_2, hdim)
-
+        self.pos = PositionEmbeddingSine(hdim)
     def forward(self, phrase_slot, vid_feat, vid_mask):
         """
         Args:
@@ -286,11 +295,15 @@ class Phrase_Context(nn.Module):
         N = phrase_slot.shape[1]
         
         context_emb = self.product([phrase_slot, vid_feat]) # [ B, N, T, C]
-        context_emb = context_emb.transpose(1, 2).contiguous().view(B*T, N, C) # [B*T, N, C]
+        context_emb = rearrange(context_emb, 'b n t c -> (b n) t c') # [B*N, T, C]
+        
+        vid_mask = repeat(vid_mask, 'b t -> (b n) t', n=N) # [B*N, T]
+        pos = self.pos(context_emb, vid_mask) # [B*N, T, C]
+        context_emb = context_emb + pos
 
         for layer in self.layers:
-            context_emb = layer(context_emb)
-        updated_phrase = context_emb.view(B, T, N, C).transpose(1, 2).contiguous() # [B, N, T, C]
+            context_emb = layer(context_emb, (B, N, T, C))
+        updated_phrase = rearrange(context_emb, '(b n) t c -> b n t c', b=B, n=N) # [B, N, T, C]
         return updated_phrase
 
 class HadamardProduct(nn.Module):
@@ -331,15 +344,15 @@ class SelfAttention(nn.Module):
             mask: [B, L]
         """
         B, L, C = x.shape
-        x = self.proj(x)
-        q, k, v = torch.split(x, C, dim=-1) # [B, L, C]
+        proj_x = self.proj(x)
+        q, k, v = torch.split(proj_x, C, dim=-1) # [B, L, C]
 
         if mask is None:
-            x, attn = self.att(q, k, v)
+            update, attn = self.att(q, k, v)
         else:
-            x, attn = self.att(q, k, v, key_padding_mask=~(mask.bool()))
-        x = self.dropout(x)
-        x = self.norm(x + v)
+            update, attn = self.att(q, k, v, key_padding_mask=~(mask.bool()))
+        update = self.dropout(update)
+        x = self.norm(x + update)
         return x, attn
     
 class CrossAttention(nn.Module):
@@ -411,3 +424,36 @@ class AttentivePooling(nn.Module):
         out = pooled.view(B, T, C)
         return out
     
+class Context_Aggregate(nn.Module):
+    def __init__(self, hdim):
+        super(Context_Aggregate, self).__init__()
+        
+        self.hdim = hdim
+        self.linear = nn.Linear(hdim, hdim)
+        self.norm = nn.LayerNorm(hdim)
+        self.dropout = nn.Dropout(0.1)
+        self.act = nn.ReLU()
+
+    def forward(self, weight, context_emb):
+        """
+        Args:
+            weight: [B, N]
+            context_emb: [B, N, T, C]
+        Returns:
+            context_agg: [B, T, C]
+        """
+        B, N, T, C = context_emb.shape
+        weight = weight.unsqueeze(-1).unsqueeze(-1) # [B, N, 1, 1]
+        context_agg = torch.sum(context_emb * weight, dim=1) # [B, T, C]
+        context_agg = self.norm(self.dropout(self.act(self.linear(context_agg)))) # [B, N, T, C]
+        return context_agg
+
+class Gating(nn.Module):
+    def __init__(self):
+        super(Gating, self).__init__()
+        self.sigmoid = nn.Sigmoid()
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, y):
+        gate = self.sigmoid(self.gate)
+        return gate * x + (1 - gate) * y

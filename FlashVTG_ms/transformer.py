@@ -65,9 +65,9 @@ class Transformer(nn.Module):
         self.t2v_encoder = TransformerCATEEncoder(t2v_encoder_layer, args.t2v_layers, encoder_norm)
 
         ## Transformer Encoder
-        encoder_layer = TransformerEncoderLayer(2 * d_model, nhead, dim_feedforward,
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
-        encoder_norm = nn.LayerNorm(2 * d_model) if normalize_before else None
+        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
         self.fuse_proj = nn.Sequential(
             nn.Linear(2 * d_model, d_model),
@@ -84,7 +84,7 @@ class Transformer(nn.Module):
                 # nn.init.xavier_uniform_(p)
                 nn.init.trunc_normal_(p, std=.02)
 
-    def forward(self, src, context_emb, mask, pos_embed, video_length=None):
+    def forward(self, src, mask, pos_embed, video_length=None):
         """
         Args:
             src: (batch_size, L, d)
@@ -103,14 +103,11 @@ class Transformer(nn.Module):
 
         vid_emb = t2v_src[:video_length]
         mask = mask[:, :video_length]
+        pos_embed = pos_embed[:video_length]
         
-        context_emb = context_emb.permute(1, 0, 2)  # (L, batch_size, d)
-        vid_fuse = torch.cat([vid_emb, context_emb], dim=2)  # (L, batch_size, d)
-        vid_pos = self.pos_embed(vid_fuse, mask).permute(1,0,2)
-        vid_fuse = self.encoder(vid_fuse, src_key_padding_mask=mask, pos=vid_pos)  # (L, batch_size, d)
-        vid_fuse = self.fuse_proj(vid_fuse)  # (L, batch_size, d)
+        vid_emb = self.encoder(vid_emb, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
         vid_emb = vid_emb.permute(1, 0, 2)  # (batch_size, L, d)
-        return vid_emb, vid_fuse, mask, pos_embed, attn_weights
+        return vid_emb, mask, pos_embed, attn_weights
 
 class TransformerCross(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=3,
@@ -446,7 +443,6 @@ class T2V_TransformerEncoderLayer(nn.Module):
                     src_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None, dummy=True):
         pass
-
 
     def forward(self, src,
                 src_mask: Optional[Tensor] = None,
