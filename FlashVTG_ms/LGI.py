@@ -445,7 +445,7 @@ class Context_Aggregate(nn.Module):
         B, N, T, C = context_emb.shape
         weight = weight.unsqueeze(-1).unsqueeze(-1) # [B, N, 1, 1]
         context_agg = torch.sum(context_emb * weight, dim=1) # [B, T, C]
-        context_agg = self.norm(self.dropout(self.act(self.linear(context_agg)))) # [B, N, T, C]
+        context_agg = self.norm(self.dropout(self.act(self.linear(context_agg)))) # [B, T, C]
         return context_agg
 
 class Gating(nn.Module):
@@ -457,3 +457,33 @@ class Gating(nn.Module):
     def forward(self, x, y):
         gate = self.sigmoid(self.gate)
         return gate * x + (1 - gate) * y
+    
+class LowRankDynamicProjector(nn.Module):
+    def __init__(self, hdim, r):
+        super().__init__()
+        self.r = r
+        self.proj_phrase = nn.Linear(hdim, hdim * r)   # Phrase -> Low-rank
+        self.shared_param = nn.Parameter(torch.randn(r, hdim))  # Learnable [r, C]
+        self.bias = nn.Parameter(torch.zeros(hdim))  # Bias for the output
+        self.dropout = nn.Dropout(0.1)
+        self.norm = nn.LayerNorm(hdim)
+        self.act = nn.ReLU()
+
+    def forward(self, phrase_emb, context_emb):
+        """
+        phrase_emb: [B, N, C]
+        context_emb: [B, T, N*C]
+        """
+        B, N, C = phrase_emb.shape
+        context_emb = rearrange(context_emb, 'b n t c -> b t (n c)')  # [B, T, N*C]
+        # 1. Generate Low-Rank Kernel
+        dyn_kernel = self.proj_phrase(phrase_emb).view(B, N, C, self.r)   # [B, N, C, r]
+        dyn_kernel = torch.matmul(dyn_kernel, self.shared_param)          # [B, N, C, C]
+        dyn_kernel = rearrange(dyn_kernel, 'b n c1 c2 -> b (n c1) c2')    # [B, N*C, C]
+
+        # 2. Apply to Context Embedding
+        # context_emb: already [B, T, N*C]
+        projected = torch.bmm(context_emb, dyn_kernel)  # [B, T, C]
+        projected = projected + self.bias
+
+        return self.norm(self.dropout(self.act(projected)))  # [B, T, C]

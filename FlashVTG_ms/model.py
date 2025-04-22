@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, AttentivePooling, Context_Aggregate, Gating
+from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, SelfAttention, Context_Aggregate, LowRankDynamicProjector
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -152,8 +152,9 @@ class FlashVTG_ms(nn.Module):
         self.context_norm_neg = nn.LayerNorm(hidden_dim)
         self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
         self.context_agg = Context_Aggregate(hidden_dim)
-        self.gate = Gating()
+        self.context_proj = LowRankDynamicProjector(hidden_dim, r=16)
 
+        self.t_sa = SelfAttention(hidden_dim, args.nheads, args.dropout)
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
             _count = [v.count('_') for v in vid]
@@ -187,7 +188,8 @@ class FlashVTG_ms(nn.Module):
         #phrase_score = self.phrase_weight(phrase_emb, src_glob) # [B, N]
         phrase_score = self.phrase_weight(phrase_emb, src_vid, src_vid_mask) # [B, N]
         context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
-        context_agg = self.context_agg(phrase_score, context_emb)
+        context_agg = self.context_proj(phrase_emb, context_emb)
+        #context_agg = self.context_agg(phrase_score, context_emb)
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -218,6 +220,8 @@ class FlashVTG_ms(nn.Module):
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
         # gating
         src_emb = context_agg
+        src_emb = src_emb + pos_vid
+        src_emb = self.t_sa(src_emb, src_vid_mask)
         # video_emb = self.agg(glob_emb, context_emb)
         memory_global = src_emb.clone().mean(1)
 
@@ -346,7 +350,8 @@ class FlashVTG_ms(nn.Module):
                 phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N]
 
                 context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
-                context_agg_neg = self.context_agg(phrase_score_neg, context_emb_neg)
+                context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
+                #context_agg_neg = self.context_agg(phrase_score_neg, context_emb_neg)
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
@@ -354,6 +359,7 @@ class FlashVTG_ms(nn.Module):
                 src_dummy_neg = torch.cat([src_vid, src_txt_dummy_neg], dim=1)
                 mask_dummy_neg = torch.cat([src_vid_mask, src_txt_mask_dummy_neg], dim=1).bool()
                 pos_neg = pos.clone() 
+                pos_vid_neg = pos_vid[real_neg_mask]
 
                 mask_dummy_neg = mask_dummy_neg[real_neg_mask] 
                 src_dummy_neg = src_dummy_neg[real_neg_mask] 
@@ -362,6 +368,8 @@ class FlashVTG_ms(nn.Module):
                 
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 vid_mem_neg = context_agg_neg
+                vid_mem_neg = vid_mem_neg + pos_vid_neg
+                vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
                 #vid_mem_neg = self.agg(memory_neg, context_emb_neg)
                 memory_global_neg = vid_mem_neg.mean(1).clone()
                 proj1_result_neg = self.saliency_proj1(vid_mem_neg)
