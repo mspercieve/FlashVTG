@@ -12,6 +12,7 @@ import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
 from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, SelfAttention, Context_Aggregate, LowRankDynamicProjector, EntropyGating
+from einops import rearrange
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -189,7 +190,7 @@ class FlashVTG_ms(nn.Module):
         phrase_score = self.phrase_weight(phrase_emb, src_glob) # [B, N]
         #phrase_score = self.phrase_weight(phrase_emb, src_vid, src_vid_mask) # [B, N]
         context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
-        context_agg = self.context_proj(phrase_emb, context_emb)
+        #context_agg = self.context_proj(phrase_emb, context_emb)
         #context_agg = self.context_agg(phrase_score, context_emb)
 
         # Dummy Generate
@@ -350,7 +351,7 @@ class FlashVTG_ms(nn.Module):
                 #phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N]
 
                 context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
-                context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
+                #context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
                 #context_agg_neg = self.context_agg(phrase_score_neg, context_emb_neg)
 
                 # dummy neg
@@ -476,8 +477,8 @@ def build_model1(args):
         args=args
     )
 
-    weight_dict = {"loss_label": args.label_loss_coef,
-                    #"loss_label": 0,
+    weight_dict = {#"loss_label": args.label_loss_coef,
+                    "loss_label": 0,
                    "loss_saliency": args.lw_saliency,
                    'loss_reg': args.lw_reg,
                    "loss_cls": args.lw_cls,
