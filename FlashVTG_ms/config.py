@@ -100,9 +100,6 @@ class BaseOptions(object):
         parser.add_argument('--num_mlp_layers', default=3, type=int,
                             help="Number of ")
         parser.add_argument('--use_SRM', action="store_true")
-        parser.add_argument('--use_dfl', action="store_true")
-        parser.add_argument('--num_bins', type=int, default=4)
-        parser.add_argument('--sample_radius', type=float, default=1.5)
 
         # * Transformer
         parser.add_argument('--enc_layers', default=3, type=int,

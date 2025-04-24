@@ -205,9 +205,9 @@ class FlashVTG_ms(nn.Module):
         
         src_emb = context_agg + vid_emb
         src_emb = src_emb + pos_vid
-        src_emb, _ = self.t_sa(src_emb, src_vid_mask)
+        src_emb = self.t_sa(src_emb, src_vid_mask)
         
-        saliency_scores = self.saliency_proj(src_emb)
+        saliency_scores = self.saliency_proj(src_emb.clone())
         video_msk = (~video_msk).int()
         pymid, pymid_msk = self.pyramid(
             src_emb, video_msk, return_mask=self.training == True
@@ -325,9 +325,9 @@ class FlashVTG_ms(nn.Module):
                 
                 vid_mem_neg = context_agg_neg + memory_neg
                 vid_mem_neg = vid_mem_neg + pos_vid_neg
-                vid_mem_neg, _ = self.t_sa(vid_mem_neg, vid_mask_neg)
+                vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
                 
-                saliency_scores_neg = self.saliency_proj(vid_mem_neg)
+                saliency_scores_neg = self.saliency_proj(vid_mem_neg.clone())
                 output["saliency_scores_neg"] = saliency_scores_neg
                 output["src_txt_mask_neg"] = src_txt_mask_dummy_neg
 

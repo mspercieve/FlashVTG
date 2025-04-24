@@ -632,9 +632,9 @@ class EntropyGating(nn.Module):
 class Saliency_proj(nn.Module):
     def __init__(self, hdim):
         super(Saliency_proj, self).__init__()
-        self.proj1 = nn.Linear(hdim)
+        self.proj1 = nn.Linear(hdim, hdim)
         self.proj2 = nn.Linear(hdim, hdim)
-
+        self.hdim = hdim
     def forward(self, x):
         """
         Args:
@@ -645,6 +645,6 @@ class Saliency_proj(nn.Module):
         x_global = x.mean(1)
         x2 = self.proj2(x_global).unsqueeze(1)
         intermediate_result = x1 * x2
-        saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(self.hdim) # [B, T]
+        saliency_scores = torch.sum(intermediate_result, dim=-1) / self.hdim ** 0.5
 
         return saliency_scores
