@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, SelfAttention, Context_Aggregate, LowRankDynamicProjector
+from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, T_SA, Context_Aggregate, LowRankDynamicProjector
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -152,9 +152,9 @@ class FlashVTG_ms(nn.Module):
         self.context_norm_neg = nn.LayerNorm(hidden_dim)
         self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
         self.context_agg = Context_Aggregate(hidden_dim)
-        self.context_proj = LowRankDynamicProjector(hidden_dim, r=16)
+        self.context_proj = LowRankDynamicProjector(hidden_dim, r=32)
 
-        self.t_sa = SelfAttention(hidden_dim, args.nheads, args.dropout)
+        self.t_sa = T_SA(hidden_dim, args.nheads, args.dropout, num_layers=1)
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
             _count = [v.count('_') for v in vid]
@@ -218,11 +218,16 @@ class FlashVTG_ms(nn.Module):
 
         # global text update
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
+
+        # score
+        video_emb = vid_emb.float()
+        query_emb = src_glob.float()
+        sim_score = F.cosine_similarity(video_emb, query_emb, dim=-1)  # (B, T)
+
         # gating
-        src_emb = context_agg
+        src_emb = context_agg + vid_emb
         src_emb = src_emb + pos_vid
         src_emb = self.t_sa(src_emb, src_vid_mask)
-        # video_emb = self.agg(glob_emb, context_emb)
         memory_global = src_emb.clone().mean(1)
 
         proj1_result = self.saliency_proj1(src_emb.clone())
@@ -236,9 +241,7 @@ class FlashVTG_ms(nn.Module):
         point = self.generator(pymid)
 
         with torch.autocast("cuda", enabled=False):
-            video_emb = vid_emb.float()
-            query_emb = src_glob.float()
-            #query_emb = self.pooling(src_txt.float(), src_txt_mask)
+            
             
             out_class = [self.class_head(e.float()) for e in pymid]
             out_class = torch.cat(out_class, dim=1)
@@ -260,8 +263,7 @@ class FlashVTG_ms(nn.Module):
             if self.training == True:
 
                 output["point"] = point
-                output["video_emb"] = video_emb
-                output["query_emb"] = query_emb
+                output["sim_score"] = sim_score
                 output["video_msk"] = video_msk
                 output["pymid_msk"] = pymid_msk
                 output["out_class"] = out_class
@@ -367,10 +369,10 @@ class FlashVTG_ms(nn.Module):
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
                 
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
-                vid_mem_neg = context_agg_neg
+                vid_mem_neg = context_agg_neg + memory_neg
                 vid_mem_neg = vid_mem_neg + pos_vid_neg
                 vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
-                #vid_mem_neg = self.agg(memory_neg, context_emb_neg)
+
                 memory_global_neg = vid_mem_neg.mean(1).clone()
                 proj1_result_neg = self.saliency_proj1(vid_mem_neg)
                 proj2_result_neg = self.saliency_proj2(memory_global_neg)

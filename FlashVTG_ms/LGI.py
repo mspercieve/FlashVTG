@@ -487,3 +487,42 @@ class LowRankDynamicProjector(nn.Module):
         projected = projected + self.bias
 
         return self.norm(self.dropout(self.act(projected)))  # [B, T, C]
+    
+class T_SA_layer(nn.Module):
+    def __init__(self, hdim, nheads, dropout=0.1):
+        super(T_SA_layer, self).__init__()
+        self.t_att = SelfAttention(hdim, nheads, dropout=dropout)
+        self.linear = nn.Linear(hdim, hdim)
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hdim)
+        self.norm1 = nn.LayerNorm(hdim)
+    def forward(self, src_emb, mask=None):
+        """
+        src_emb: [B, T, C]
+        """
+        # T-axis self-attention
+        src_emb, _ = self.t_att(src_emb, mask) # [B*N, T, C]
+        update = self.dropout(self.act(self.linear(src_emb)))
+        src_emb = self.norm(src_emb + update)
+
+        return src_emb
+
+class T_SA(nn.Module):
+    def __init__(self, hdim, nheads, dropout=0.1, num_layers=2):
+        super(T_SA, self).__init__()
+        self.hdim = hdim
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([T_SA_layer(hdim, nheads, dropout) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src_emb, mask=None):
+        """
+        Args:
+            src_emb: [B, T, C]
+        Returns:
+            updated_phrase: [B, T, C]
+        """
+        for layer in self.layers:
+            src_emb = layer(src_emb, mask)
+        return src_emb
