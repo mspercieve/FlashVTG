@@ -296,8 +296,9 @@ class FlashVTG_ms(nn.Module):
             ### Neg Pairs ###
             neg_vid = ori_vid[1:] + ori_vid[:1] 
             real_neg_mask = torch.Tensor(element_wise_list_equal(ori_vid, neg_vid)).to(src_txt_dummy.device)
-            real_neg_mask = real_neg_mask == False
-            if real_neg_mask.sum() != 0:
+            real_neg_mask = ~real_neg_mask.bool()
+
+            if real_neg_mask.any():
                 # phrase neg
                 phrase_emb_neg = torch.cat([phrase_emb[1:], phrase_emb[0:1]], dim=0)
                 src_vid_neg = src_vid[real_neg_mask]
