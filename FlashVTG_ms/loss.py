@@ -163,13 +163,13 @@ class SampledNCELoss(nn.Module):
                 .format(self.temperature, self.max_scale, self.learnable, self.direction,
                         self.loss_weight))
 
-    def forward(self, video_emb, query_emb, video_msk, saliency, pos_clip):
-        batch_inds = torch.arange(video_emb.size(0), device=video_emb.device)
+    def forward(self, sim_score, video_msk, saliency, pos_clip):
+        batch_inds = torch.arange(sim_score.size(0), device=sim_score.device)
         pos_scores = saliency[batch_inds, pos_clip].unsqueeze(-1)
         loss_msk = (saliency <= pos_scores) * video_msk
 
-        scale = self.scale.exp().clamp(max=self.max_scale).to(video_emb.device)
-        i_sim = F.cosine_similarity(video_emb, query_emb, dim=-1) * scale
+        scale = self.scale.exp().clamp(max=self.max_scale).to(sim_score.device)
+        i_sim = sim_score * scale
         i_sim = i_sim + torch.where(loss_msk > 0, .0, float('-inf'))
 
         loss = 0
@@ -479,14 +479,13 @@ class SetCriterion(nn.Module):
 
     def loss_sal(self, outputs, targets, log=True):
 
-        video_emb = outputs['video_emb']
-        query_emb = outputs['query_emb']
+        sim_score = outputs["sim_score"]
         video_msk = outputs['video_msk']
         saliency = targets["saliency_all_labels"]
         pos_clip = targets["saliency_pos_labels"][:, 0]
 
         sampled_nce = SampledNCELoss()
-        loss_sal = sampled_nce(video_emb, query_emb, video_msk, saliency, pos_clip)
+        loss_sal = sampled_nce(sim_score, video_msk, saliency, pos_clip)
         return {"loss_sal": loss_sal}
 
     def loss_reg(self, outputs, targets, log=True):

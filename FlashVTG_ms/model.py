@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, AttentivePooling, Context_Aggregate, Gating
+from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, SelfAttention, Context_Aggregate, LowRankDynamicProjector, EntropyGating
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -152,8 +152,10 @@ class FlashVTG_ms(nn.Module):
         self.context_norm_neg = nn.LayerNorm(hidden_dim)
         self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
         self.context_agg = Context_Aggregate(hidden_dim)
-        self.gate = Gating()
+        self.context_proj = LowRankDynamicProjector(hidden_dim, r=32)
+        self.gate = EntropyGating()
 
+        self.t_sa = SelfAttention(hidden_dim, args.nheads, args.dropout)
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
             _count = [v.count('_') for v in vid]
@@ -187,7 +189,8 @@ class FlashVTG_ms(nn.Module):
         phrase_score = self.phrase_weight(phrase_emb, src_glob) # [B, N]
         #phrase_score = self.phrase_weight(phrase_emb, src_vid, src_vid_mask) # [B, N]
         context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
-        context_agg = self.context_agg(phrase_score, context_emb)
+        context_agg = self.context_proj(phrase_emb, context_emb)
+        #context_agg = self.context_agg(phrase_score, context_emb)
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -213,11 +216,15 @@ class FlashVTG_ms(nn.Module):
         pos = torch.cat([pos_vid, pos_txt_dummy], dim=1)
 
         video_length = src_vid.shape[1]
-
         # global text update
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
+        t2vattnvalues = (attn_weights[:,:,self.args.num_dummies:]).sum(2)
         # gating
-        src_emb = context_agg + vid_emb
+        
+        entropy_gate = self.gate(t2vattnvalues, src_vid_mask)
+        src_emb = entropy_gate * context_agg + vid_emb
+        src_emb = src_emb + pos_vid
+        src_emb, _ = self.t_sa(src_emb, src_vid_mask)
         # video_emb = self.agg(glob_emb, context_emb)
         memory_global = src_emb.clone().mean(1)
 
@@ -234,8 +241,7 @@ class FlashVTG_ms(nn.Module):
         with torch.autocast("cuda", enabled=False):
             video_emb = vid_emb.float()
             query_emb = src_glob.float()
-            #query_emb = self.pooling(src_txt.float(), src_txt_mask)
-            
+            sim_score = F.cosine_similarity(video_emb, query_emb, dim=-1)  # (bsz, T)            
             out_class = [self.class_head(e.float()) for e in pymid]
             out_class = torch.cat(out_class, dim=1)
             if self.coord_head is not None:
@@ -250,14 +256,12 @@ class FlashVTG_ms(nn.Module):
             bs, t = src_vid.shape[0], src_vid.shape[1]
             output = dict(_avg_factor=bs)
             output["saliency_scores"] = saliency_scores
-            output["t2vattnvalues"] = (attn_weights[:,:,self.args.num_dummies:] * (src_txt_mask.unsqueeze(1).repeat(1, video_length, 1))).sum(2)
+            output["t2vattnvalues"] = (attn_weights[:,:,self.args.num_dummies:]).squeeze(2)
             output["t2vattnvalues"] = torch.clamp(output["t2vattnvalues"], 0, 1)
             output["sqan_att"] = phrase_att
             if self.training == True:
-
+                output["sim_score"] = sim_score
                 output["point"] = point
-                output["video_emb"] = video_emb
-                output["query_emb"] = query_emb
                 output["video_msk"] = video_msk
                 output["pymid_msk"] = pymid_msk
                 output["out_class"] = out_class
@@ -346,7 +350,8 @@ class FlashVTG_ms(nn.Module):
                 #phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N]
 
                 context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
-                context_agg_neg = self.context_agg(phrase_score_neg, context_emb_neg)
+                context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
+                #context_agg_neg = self.context_agg(phrase_score_neg, context_emb_neg)
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
@@ -354,6 +359,7 @@ class FlashVTG_ms(nn.Module):
                 src_dummy_neg = torch.cat([src_vid, src_txt_dummy_neg], dim=1)
                 mask_dummy_neg = torch.cat([src_vid_mask, src_txt_mask_dummy_neg], dim=1).bool()
                 pos_neg = pos.clone() 
+                pos_vid_neg = pos_vid[real_neg_mask]
 
                 mask_dummy_neg = mask_dummy_neg[real_neg_mask] 
                 src_dummy_neg = src_dummy_neg[real_neg_mask] 
@@ -361,7 +367,12 @@ class FlashVTG_ms(nn.Module):
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
                 
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
-                vid_mem_neg = context_agg_neg + memory_neg
+                
+                score_neg = F.cosine_similarity(memory_neg, src_glob_neg[real_neg_mask], dim=-1)  # (bsz, T)
+                entropy_gate_neg = self.gate(score_neg, vid_mask_neg)
+                vid_mem_neg = entropy_gate_neg * context_agg_neg + memory_neg
+                vid_mem_neg = vid_mem_neg + pos_vid_neg
+                vid_mem_neg, _ = self.t_sa(vid_mem_neg, vid_mask_neg)
                 #vid_mem_neg = self.agg(memory_neg, context_emb_neg)
                 memory_global_neg = vid_mem_neg.mean(1).clone()
                 proj1_result_neg = self.saliency_proj1(vid_mem_neg)
@@ -372,7 +383,7 @@ class FlashVTG_ms(nn.Module):
                 output["saliency_scores_neg"] = saliency_scores_neg
                 output["src_txt_mask_neg"] = src_txt_mask_dummy_neg
 
-                output["t2vattnvalues_neg"] = (attn_weights_neg[:, :, self.args.num_dummies:] * (src_txt_mask_dummy_neg[:, self.args.num_dummies:].unsqueeze(1).repeat(1, video_length, 1))).sum(2)
+                output["t2vattnvalues_neg"] = (attn_weights_neg[:, :, self.args.num_dummies:]).squeeze(2)
                 output["t2vattnvalues_neg"] = torch.clamp(output["t2vattnvalues_neg"], 0, 1) 
             else:
                 output["saliency_scores_neg"] = None
@@ -404,56 +415,6 @@ class Parameter(nn.Parameter):
             data = torch.randn(args, **kwargs) / args[-1]**0.5
 
         return torch.Tensor._make_subclass(cls, data, requires_grad)
-
-
-class SampledNCELoss(nn.Module):
-
-    def __init__(self,
-                 temperature=0.07,
-                 max_scale=100,
-                 learnable=False,
-                 direction=('row', 'col')):
-        super(SampledNCELoss, self).__init__()
-
-        scale = torch.Tensor([math.log(1 / temperature)])
-
-        if learnable:
-            self.scale = Parameter(scale)
-        else:
-            self.register_buffer('scale', scale)
-
-        self.temperature = temperature
-        self.max_scale = max_scale
-        self.learnable = learnable
-        self.direction = (direction, ) if isinstance(direction, str) else direction
-
-    def extra_repr(self):
-        return ('temperature={}, max_scale={}, learnable={}, direction={}, loss_weight={}'
-                .format(self.temperature, self.max_scale, self.learnable, self.direction,
-                        self.loss_weight))
-
-    def forward(self, video_emb, query_emb, video_msk, saliency, pos_clip):
-        batch_inds = torch.arange(video_emb.size(0), device=video_emb.device)
-
-        pos_scores = saliency[batch_inds, pos_clip].unsqueeze(-1)
-        loss_msk = (saliency <= pos_scores) * video_msk
-
-        scale = self.scale.exp().clamp(max=self.max_scale)
-        i_sim = F.cosine_similarity(video_emb, query_emb, dim=-1) * scale # (B, T)
-        i_sim = i_sim + torch.where(loss_msk > 0, .0, float('-inf'))
-
-        loss = 0
-
-        if 'row' in self.direction:
-            i_met = F.log_softmax(i_sim, dim=1)[batch_inds, pos_clip] 
-            loss = loss - i_met.sum() / i_met.size(0)
-
-        if 'col' in self.direction:
-            j_sim = i_sim.t()
-            j_met = F.log_softmax(j_sim, dim=1)[pos_clip, batch_inds]
-            loss = loss - j_met.sum() / j_met.size(0)
-
-        return loss
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
