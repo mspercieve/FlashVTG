@@ -479,14 +479,13 @@ class SetCriterion(nn.Module):
 
     def loss_sal(self, outputs, targets, log=True):
 
-        video_emb = outputs['video_emb']
-        query_emb = outputs['query_emb']
+        sim_score = outputs["sim_score"]
         video_msk = outputs['video_msk']
         saliency = targets["saliency_all_labels"]
         pos_clip = targets["saliency_pos_labels"][:, 0]
 
         sampled_nce = SampledNCELoss()
-        loss_sal = sampled_nce(video_emb, query_emb, video_msk, saliency, pos_clip)
+        loss_sal = sampled_nce(sim_score, video_msk, saliency, pos_clip)
         return {"loss_sal": loss_sal}
 
     def loss_reg(self, outputs, targets, log=True):

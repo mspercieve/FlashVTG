@@ -246,27 +246,38 @@ class PhraseContextLayer(nn.Module):
         super(PhraseContextLayer, self).__init__()
         self.n_att = SelfAttention(hdim, nheads, dropout=dropout)
         self.t_att = SelfAttention(hdim, nheads, dropout=dropout)
-        self.linear = nn.Linear(hdim, hdim)
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(hdim)
-        self.norm1 = nn.LayerNorm(hdim)
-    def forward(self, context_emb, shape):
+
+        self.fc_t = nn.Sequential(
+            nn.Linear(hdim, hdim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.fc_n = nn.Sequential(
+            nn.Linear(hdim, hdim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.norm_t = nn.LayerNorm(hdim)
+        self.norm_n = nn.LayerNorm(hdim)
+
+    def forward(self, context_emb, vid_mask, shape):
         """
         context_emb: [B*N, T, C]
         """
         B, N, T, C = shape
         # T-axis self-attention
-        context_emb, _ = self.t_att(context_emb, None) # [B*N, T, C]
+        context_emb, _ = self.t_att(context_emb, vid_mask) # [B*N, T, C]
+        t_update = self.fc_t(context_emb) # [B*N, T, C]
+        context_emb = self.norm_t(context_emb + t_update) # [B*N, T, C]
         context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B*T, N, C]
         # N-axis self-attention
         context_att, _ = self.n_att(context_emb, None) # [B*T,N,C]
         context_emb = rearrange(context_att, '(b t) n c -> (b n) t c', b=B, n=N) # [B*N, T, C]
-        # feedforward with residual connection
-        update = self.dropout(self.act(self.linear(context_emb)))
-        context_emb = self.norm(context_emb + update)
+        n_update = self.fc_n(context_emb)
+        context_emb = self.norm_n(context_emb + n_update)
 
         return context_emb
+
 
 class Phrase_Context(nn.Module):
     def __init__(self, hdim, nheads, dropout=0.1, num_layers=2, product_idim_1=None, product_idim_2=None):
@@ -283,6 +294,7 @@ class Phrase_Context(nn.Module):
 
         self.product = HadamardProduct(product_idim_1, product_idim_2, hdim)
         self.pos = PositionEmbeddingSine(hdim)
+
     def forward(self, phrase_slot, vid_feat, vid_mask):
         """
         Args:
@@ -302,8 +314,75 @@ class Phrase_Context(nn.Module):
         context_emb = context_emb + pos
 
         for layer in self.layers:
-            context_emb = layer(context_emb, (B, N, T, C))
+            context_emb = layer(context_emb, vid_mask, (B, N, T, C))
         updated_phrase = rearrange(context_emb, '(b n) t c -> b n t c', b=B, n=N) # [B, N, T, C]
+        return updated_phrase
+
+
+class PhraseContextLayerv2(nn.Module):
+    def __init__(self, hdim, nheads, dropout=0.1, type='t'):
+        super(PhraseContextLayerv2, self).__init__()
+        self.att = SelfAttention(hdim, nheads, dropout=dropout)
+
+        self.fc = nn.Sequential(
+            nn.Linear(hdim, hdim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(hdim)
+        self.norm_n = nn.LayerNorm(hdim)
+
+    def forward(self, context_emb, vid_mask=None):
+        """
+        context_emb: [B*N, T, C]
+        """
+        context_emb, _ = self.att(context_emb, vid_mask) # [B*N, T, C]
+        update = self.fc(context_emb)
+        context_emb = self.norm(context_emb + update)
+        return context_emb
+
+
+class Phrase_Contextv2(nn.Module):
+    def __init__(self, hdim, nheads, dropout=0.1, num_layers=2, product_idim_1=None, product_idim_2=None):
+        super(Phrase_Contextv2, self).__init__()
+        self.hdim = hdim
+        self.num_layers = num_layers
+        self.dropout = nn.Dropout(dropout)
+        self.t_layers = nn.ModuleList([PhraseContextLayerv2(hdim, nheads, dropout, type='t') for _ in range(num_layers)])
+        self.n_layers = nn.ModuleList([PhraseContextLayerv2(hdim, nheads, dropout, type='n') for _ in range(num_layers)])
+        if product_idim_1 is None:
+            product_idim_1 = hdim
+        if product_idim_2 is None:
+            product_idim_2 = hdim
+
+        self.product = HadamardProduct(product_idim_1, product_idim_2, hdim)
+        self.pos = PositionEmbeddingSine(hdim)
+        
+    def forward(self, phrase_slot, vid_feat, vid_mask):
+        """
+        Args:
+            phrase_slot: [B, N, C] phrase slots
+            vid_feat: [B, T, C] video-level features
+        Returns:
+            updated_phrase: [B, T, N, C]
+        """
+        B, T, C = vid_feat.shape
+        N = phrase_slot.shape[1]
+        
+        context_emb = self.product([phrase_slot, vid_feat]) # [ B, N, T, C]
+        context_emb = rearrange(context_emb, 'b n t c -> (b n) t c') # [B*N, T, C]
+        
+        vid_mask = repeat(vid_mask, 'b t -> (b n) t', n=N) # [B*N, T]
+        pos = self.pos(context_emb, vid_mask) # [B*N, T, C]
+        context_emb = context_emb + pos
+
+        # t first, then n
+        for t_layer in self.t_layers:
+            context_emb = t_layer(context_emb, vid_mask)
+        context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B, T, N, C]')
+        for n_layer in self.n_layers:
+            context_emb = n_layer(context_emb, None)
+        updated_phrase = rearrange(context_emb, '(b t) n c -> b n t c', b=B, t=T) # [B, N, T, C]
         return updated_phrase
 
 class HadamardProduct(nn.Module):
@@ -333,7 +412,9 @@ class SelfAttention(nn.Module):
         self.hdim = hdim
         self.nheads = nheads
         self.att = nn.MultiheadAttention(hdim, nheads, batch_first=True, dropout=dropout)
-        self.proj = nn.Linear(hdim, 3 * hdim)
+        self.q_proj = nn.Linear(hdim, hdim)
+        self.k_proj = nn.Linear(hdim, hdim)
+        self.v_proj = nn.Linear(hdim, hdim)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hdim)
         
@@ -344,8 +425,9 @@ class SelfAttention(nn.Module):
             mask: [B, L]
         """
         B, L, C = x.shape
-        proj_x = self.proj(x)
-        q, k, v = torch.split(proj_x, C, dim=-1) # [B, L, C]
+        q = self.q_proj(x) # [B, L, C]
+        k = self.k_proj(x) # [B, L, C]
+        v = self.v_proj(x) # [B, L, C]
 
         if mask is None:
             update, attn = self.att(q, k, v)
@@ -447,16 +529,6 @@ class Context_Aggregate(nn.Module):
         context_agg = torch.sum(context_emb * weight, dim=1) # [B, T, C]
         context_agg = self.norm(self.dropout(self.act(self.linear(context_agg)))) # [B, T, C]
         return context_agg
-
-class Gating(nn.Module):
-    def __init__(self):
-        super(Gating, self).__init__()
-        self.sigmoid = nn.Sigmoid()
-        self.gate = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x, y):
-        gate = self.sigmoid(self.gate)
-        return gate * x + (1 - gate) * y
     
 class LowRankDynamicProjector(nn.Module):
     def __init__(self, hdim, r):
@@ -526,3 +598,53 @@ class T_SA(nn.Module):
         for layer in self.layers:
             src_emb = layer(src_emb, mask)
         return src_emb
+    
+class EntropyGating(nn.Module):
+    def __init__(self, tau=0.1, scale=5.0, shift=2.5):
+        """
+        tau: softmax temperature
+        scale, shift: entropy scaling
+        """
+        super().__init__()
+        self.tau = tau
+        self.scale = scale
+        self.shift = shift
+
+    def forward(self, score, mask):
+        """
+        Args:
+            score: [B, T]   # t2v attention values (0~1)
+            mask:  [B, T]   # valid=1, pad=0
+        Returns:
+            gate: [B, 1, 1]
+        """
+        # 1. Masked Softmax
+        masked_score = score.masked_fill(mask == 0, float('-inf'))
+        prob = F.softmax(masked_score / self.tau, dim=1)   # [B, T]
+        entropy = -torch.sum(prob * torch.log(prob + 1e-6) * mask, dim=1)   # [B]
+        valid_lengths = mask.sum(dim=1)
+        entropy = entropy / torch.log(valid_lengths)
+        entropy = torch.clamp(entropy, min=0.0, max=1.0)
+        print('entropy', entropy[:3])
+
+        return entropy.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+    
+class Saliency_proj(nn.Module):
+    def __init__(self, hdim):
+        super(Saliency_proj, self).__init__()
+        self.proj1 = nn.Linear(hdim)
+        self.proj2 = nn.Linear(hdim, hdim)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, T, C]
+        """
+        B, T, C = x.shape
+        x1 = self.proj1(x)
+        x_global = x.mean(1)
+        x2 = self.proj2(x_global).unsqueeze(1)
+        intermediate_result = x1 * x2
+        saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(self.hdim) # [B, T]
+
+        return saliency_scores

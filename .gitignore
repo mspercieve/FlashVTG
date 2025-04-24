@@ -2,4 +2,5 @@
 /wandb
 /.vscode
 /visualize
-/FlashVTG_ms/scripts/
+/FlashVTG_ms/scripts/*
+!/FlashVTG_ms/scripts/.gitkeep

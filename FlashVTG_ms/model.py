@@ -11,7 +11,8 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, PhraseWeight_vid, PhraseWeight_eos, Phrase_Context, CrossAttention, T_SA, Context_Aggregate, LowRankDynamicProjector
+from LGI import Phrase_Generate, T_SA, Phrase_Context, Phrase_Contextv2, LowRankDynamicProjector, EntropyGating, Saliency_proj
+from einops import rearrange
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -90,8 +91,6 @@ class FlashVTG_ms(nn.Module):
         self.position_embed = position_embed
         self.txt_position_embed = txt_position_embed
         hidden_dim = transformer.d_model
-        self.saliency_proj1 = nn.Linear(hidden_dim, hidden_dim)
-        self.saliency_proj2 = nn.Linear(hidden_dim, hidden_dim)
         self.hidden_dim = hidden_dim
         self.PositionEmbeddingSine = PositionEmbeddingSine(hidden_dim, normalize=True)
         
@@ -145,16 +144,13 @@ class FlashVTG_ms(nn.Module):
 
         # build phrase embedding
         self.phrase_generate = Phrase_Generate(args.num_phrase, hidden_dim, args.nheads, args.dropout, args.phrase_layers)
-        #self.phrase_weight = PhraseWeight_eos(args.hidden_dim)
-        self.phrase_weight = PhraseWeight_vid()
         self.phrase_context = Phrase_Context(hidden_dim, args.nheads, args.dropout, args.context_layers)
-        self.context_norm = nn.LayerNorm(hidden_dim)
-        self.context_norm_neg = nn.LayerNorm(hidden_dim)
-        self.cross_attn = CrossAttention(hidden_dim, args.nheads, args.dropout)
-        self.context_agg = Context_Aggregate(hidden_dim)
-        self.context_proj = LowRankDynamicProjector(hidden_dim, r=32)
+        #self.phrase_context = Phrase_Contextv2(hidden_dim, args.nheads, args.dropout, args.context_layers)
+        self.context_proj = LowRankDynamicProjector(hidden_dim, r=args.rank)
+        self.gate = EntropyGating()
+        self.t_sa = T_SA(hidden_dim, args.nheads, args.dropout, num_layers=args.t_sa)
+        self.saliency_proj = Saliency_proj(hidden_dim)
 
-        self.t_sa = T_SA(hidden_dim, args.nheads, args.dropout, num_layers=1)
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
         if vid is not None:
             _count = [v.count('_') for v in vid]
@@ -176,7 +172,7 @@ class FlashVTG_ms(nn.Module):
         src_txt = src_txt + self.token_type_embeddings(torch.zeros_like(src_txt_mask.long()))
         # Add position embeddings
 
-        pos_vid = self.position_embed(torch.cat([src_vid, src_vid], dim=-1), src_vid_mask)
+        pos_vid = self.position_embed(src_vid, src_vid_mask)
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
         # separate sentence and word
         _, src_word_msk = torch.split(src_txt_mask, [1, src_txt_mask.size(1)-1], dim=1)
@@ -184,56 +180,34 @@ class FlashVTG_ms(nn.Module):
 
         # Phrase Generate
         phrase_emb, phrase_att = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
-        # key phrase score
-        #phrase_score = self.phrase_weight(phrase_emb, src_glob) # [B, N]
-        phrase_score = self.phrase_weight(phrase_emb, src_vid, src_vid_mask) # [B, N]
         context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
         context_agg = self.context_proj(phrase_emb, context_emb)
-        #context_agg = self.context_agg(phrase_score, context_emb)
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
         src_txt_dummy = torch.cat([txt_dummy, src_glob], dim=1)
-
-
-        src_txt_mask_dummy = torch.tensor([[True] * (self.args.num_dummies + 1)]).to(src_txt_mask.device).repeat(src_txt_mask.shape[0], 1)
-
+        src_txt_mask_dummy = torch.ones(src_txt.shape[0], self.args.num_dummies + 1).to(src_txt.device)
         pos_dummy = self.dummy_rep_pos.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(pos_txt.shape[0], 1, 1)
         pos_txt_dummy = torch.cat([pos_dummy, pos_glob], dim=1)
         src_txt_dummy = src_txt_dummy.permute(1, 0, 2) # (L, batch_size, d)
         pos_txt_dummy = pos_txt_dummy.permute(1, 0, 2) # (L, batch_size, d)
-
         memory = self.txtproj_encoder(src_txt_dummy, src_key_padding_mask=~(src_txt_mask_dummy.bool()), pos=pos_txt_dummy)
         dummy_token = memory[:self.args.num_dummies].permute(1, 0, 2)
-        pos_txt_dummy = pos_txt_dummy.permute(1, 0, 2)
-
         src_txt_dummy = torch.cat([dummy_token, src_glob], dim=1)
-        src_txt_mask_dummy = torch.tensor([[True] * (self.args.num_dummies + 1)]).to(src_txt_mask.device).repeat(src_txt_mask.shape[0], 1)
-
         src = torch.cat([src_vid, src_txt_dummy], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask_dummy], dim=1).bool()  # (bsz, L_vid+L_txt)
-        pos = torch.cat([pos_vid, pos_txt_dummy], dim=1)
-
+        pos = torch.cat([pos_vid, pos_txt_dummy.permute(1,0,2)], dim=1)
         video_length = src_vid.shape[1]
 
         # global text update
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
-
-        # score
-        video_emb = vid_emb.float()
-        query_emb = src_glob.float()
-        sim_score = F.cosine_similarity(video_emb, query_emb, dim=-1)  # (B, T)
-
-        # gating
+        t2vattnvalues = (attn_weights[:,:,self.args.num_dummies:]).sum(2)
+        
         src_emb = context_agg + vid_emb
         src_emb = src_emb + pos_vid
-        src_emb = self.t_sa(src_emb, src_vid_mask)
-        memory_global = src_emb.clone().mean(1)
-
-        proj1_result = self.saliency_proj1(src_emb.clone())
-        proj2_result = self.saliency_proj2(memory_global).unsqueeze(1)
-        intermediate_result = proj1_result * proj2_result  # (bsz, L, d)
-        saliency_scores = torch.sum(intermediate_result, dim=-1) / np.sqrt(self.hidden_dim)  # (bsz, L)
+        src_emb, _ = self.t_sa(src_emb, src_vid_mask)
+        
+        saliency_scores = self.saliency_proj(src_emb)
         video_msk = (~video_msk).int()
         pymid, pymid_msk = self.pyramid(
             src_emb, video_msk, return_mask=self.training == True
@@ -241,8 +215,9 @@ class FlashVTG_ms(nn.Module):
         point = self.generator(pymid)
 
         with torch.autocast("cuda", enabled=False):
-            
-            
+            video_emb = vid_emb.float()
+            query_emb = src_glob.float()
+            sim_score = F.cosine_similarity(video_emb, query_emb, dim=-1)  # (bsz, T)            
             out_class = [self.class_head(e.float()) for e in pymid]
             out_class = torch.cat(out_class, dim=1)
             if self.coord_head is not None:
@@ -257,36 +232,18 @@ class FlashVTG_ms(nn.Module):
             bs, t = src_vid.shape[0], src_vid.shape[1]
             output = dict(_avg_factor=bs)
             output["saliency_scores"] = saliency_scores
-            output["t2vattnvalues"] = (attn_weights[:,:,self.args.num_dummies:] * (src_txt_mask.unsqueeze(1).repeat(1, video_length, 1))).sum(2)
+            output["t2vattnvalues"] = (attn_weights[:,:,self.args.num_dummies:]).squeeze(2)
             output["t2vattnvalues"] = torch.clamp(output["t2vattnvalues"], 0, 1)
             output["sqan_att"] = phrase_att
-            if self.training == True:
 
-                output["point"] = point
+            if self.training == True:
                 output["sim_score"] = sim_score
+                output["point"] = point
                 output["video_msk"] = video_msk
                 output["pymid_msk"] = pymid_msk
                 output["out_class"] = out_class
                 output["out_coord"] = out_coord 
-                '''
-                boundarys = []
-                out_class = out_class.sigmoid() # [bs, (1+1/2+1/4+1/8)L, 1]
-                for idx, boundary in enumerate(out_coord):
-                    boundary = boundary.clone()
 
-                    boundary[:, 0] = boundary[:, 0] * -1
-                    boundary = boundary * point[:, 3, None].repeat(1, 2)
-                    boundary = boundary + point[:, 0, None].repeat(1, 2)
-                    boundary = boundary / (1/self.args.clip_length)
-                    boundary = torch.cat((boundary, out_class[idx]), dim=-1)  
-
-                    _, inds = out_class[idx, :, 0].sort(descending=True)
-                    boundary = boundary[inds[:]]
-                    boundarys.append(boundary)
-
-                boundarys = torch.stack(boundarys, dim=0)
-                output["pred_spans"] = boundarys
-                '''
 
             if self.training == False:
                 assert bs == 1, "batch size larger than 1 is not supported for inference"
@@ -347,13 +304,8 @@ class FlashVTG_ms(nn.Module):
                 vid_mask_neg = src_vid_mask[real_neg_mask]
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
 
-                src_glob_neg = torch.cat([src_glob[1:], src_glob[0:1]], dim=0)
-                #phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_glob_neg[real_neg_mask]) # [B, N]
-                phrase_score_neg = self.phrase_weight(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N]
-
                 context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
                 context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
-                #context_agg_neg = self.context_agg(phrase_score_neg, context_emb_neg)
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
@@ -369,20 +321,16 @@ class FlashVTG_ms(nn.Module):
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
                 
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
+                
                 vid_mem_neg = context_agg_neg + memory_neg
                 vid_mem_neg = vid_mem_neg + pos_vid_neg
-                vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
-
-                memory_global_neg = vid_mem_neg.mean(1).clone()
-                proj1_result_neg = self.saliency_proj1(vid_mem_neg)
-                proj2_result_neg = self.saliency_proj2(memory_global_neg)
-                proj2_result_neg = proj2_result_neg.unsqueeze(1)
-                intermediate_result_neg = proj1_result_neg * proj2_result_neg
-                saliency_scores_neg = torch.sum(intermediate_result_neg, dim=-1) / np.sqrt(self.hidden_dim)
+                vid_mem_neg, _ = self.t_sa(vid_mem_neg, vid_mask_neg)
+                
+                saliency_scores_neg = self.saliency_proj(vid_mem_neg)
                 output["saliency_scores_neg"] = saliency_scores_neg
                 output["src_txt_mask_neg"] = src_txt_mask_dummy_neg
 
-                output["t2vattnvalues_neg"] = (attn_weights_neg[:, :, self.args.num_dummies:] * (src_txt_mask_dummy_neg[:, self.args.num_dummies:].unsqueeze(1).repeat(1, video_length, 1))).sum(2)
+                output["t2vattnvalues_neg"] = (attn_weights_neg[:, :, self.args.num_dummies:]).squeeze(2)
                 output["t2vattnvalues_neg"] = torch.clamp(output["t2vattnvalues_neg"], 0, 1) 
             else:
                 output["saliency_scores_neg"] = None
@@ -414,56 +362,6 @@ class Parameter(nn.Parameter):
             data = torch.randn(args, **kwargs) / args[-1]**0.5
 
         return torch.Tensor._make_subclass(cls, data, requires_grad)
-
-
-class SampledNCELoss(nn.Module):
-
-    def __init__(self,
-                 temperature=0.07,
-                 max_scale=100,
-                 learnable=False,
-                 direction=('row', 'col')):
-        super(SampledNCELoss, self).__init__()
-
-        scale = torch.Tensor([math.log(1 / temperature)])
-
-        if learnable:
-            self.scale = Parameter(scale)
-        else:
-            self.register_buffer('scale', scale)
-
-        self.temperature = temperature
-        self.max_scale = max_scale
-        self.learnable = learnable
-        self.direction = (direction, ) if isinstance(direction, str) else direction
-
-    def extra_repr(self):
-        return ('temperature={}, max_scale={}, learnable={}, direction={}, loss_weight={}'
-                .format(self.temperature, self.max_scale, self.learnable, self.direction,
-                        self.loss_weight))
-
-    def forward(self, video_emb, query_emb, video_msk, saliency, pos_clip):
-        batch_inds = torch.arange(video_emb.size(0), device=video_emb.device)
-
-        pos_scores = saliency[batch_inds, pos_clip].unsqueeze(-1)
-        loss_msk = (saliency <= pos_scores) * video_msk
-
-        scale = self.scale.exp().clamp(max=self.max_scale)
-        i_sim = F.cosine_similarity(video_emb, query_emb, dim=-1) * scale # (B, T)
-        i_sim = i_sim + torch.where(loss_msk > 0, .0, float('-inf'))
-
-        loss = 0
-
-        if 'row' in self.direction:
-            i_met = F.log_softmax(i_sim, dim=1)[batch_inds, pos_clip] 
-            loss = loss - i_met.sum() / i_met.size(0)
-
-        if 'col' in self.direction:
-            j_sim = i_sim.t()
-            j_met = F.log_softmax(j_sim, dim=1)[pos_clip, batch_inds]
-            loss = loss - j_met.sum() / j_met.size(0)
-
-        return loss
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
@@ -526,7 +424,7 @@ def build_model1(args):
     )
 
     weight_dict = {"loss_label": args.label_loss_coef,
-                    #"loss_label": 0,
+                   # "loss_label": 0,
                    "loss_saliency": args.lw_saliency,
                    'loss_reg': args.lw_reg,
                    "loss_cls": args.lw_cls,

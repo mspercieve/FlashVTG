@@ -137,6 +137,11 @@ class BaseOptions(object):
         parser.add_argument("--num_phrase", type=int, default=3, help="number of phrases")
         parser.add_argument("--phrase_layers", type=int, default=2, help="number of phrase layers")
         parser.add_argument("--context_layers", type=int, default=2, help="number of context layers")
+        parser.add_argument('--use_dfl', action="store_true")
+        parser.add_argument('--num_bins', type=int, default=4)
+        parser.add_argument('--sample_radius', type=float, default=1.5)
+        parser.add_argument('--rank', type=int, default=32)
+        parser.add_argument('--t_sa', type=int, default=1)
         # Loss
         parser.add_argument("--saliency_margin", type=float, default=0.2)
         parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
