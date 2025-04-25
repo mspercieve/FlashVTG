@@ -179,8 +179,8 @@ class FlashVTG_ms(nn.Module):
 
         # Phrase Generate
         phrase_emb, phrase_att = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
-        context_emb = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, N, T, C]
-        context_agg = self.context_proj(phrase_emb, context_emb)
+        context_agg = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, T, C]
+        #context_agg = self.context_proj(phrase_emb, context_emb)
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -302,8 +302,8 @@ class FlashVTG_ms(nn.Module):
                 vid_mask_neg = src_vid_mask[real_neg_mask]
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
 
-                context_emb_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
-                context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
+                context_agg_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
+                #context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)

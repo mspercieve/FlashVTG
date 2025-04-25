@@ -146,7 +146,7 @@ class Phrase_Generate(nn.Module):
         word_pos = self.pos(word_emb, word_mask)
         word_pe = word_emb + word_pos
         for i in range(self.num_layers):
-            phrase_slot = self.phrase_att[i](word_pe, word_mask, phrase_slot)
+            phrase_slot = self.phrase_att[i](txt_emb, txt_mask, phrase_slot)
             
         return phrase_slot, phrase_attn
 
@@ -206,42 +206,71 @@ class SlotAttention(nn.Module):
         phrase_slot = self.norm1(phrase_slot)
         return phrase_slot
 
-    
-class PhraseWeight_vid(nn.Module):
-    def __init__(self, temperature=1.0):
-        super(PhraseWeight_vid, self).__init__()
-        self.tau = temperature
+class LowRankDynamicConv(nn.Module):
+    def __init__(self, hdim, num_phrase, rank=32, t_kernels=(1, 3, 5)):
+        super().__init__()
+        self.hdim = hdim
+        self.num_phrase = num_phrase
+        self.rank = rank
+        self.t_kernels = t_kernels
 
-    def forward(self, phrase_slot, vid_feat, vid_mask):
-    # Compute attention weights
-        dot_product = torch.einsum('btc,bnc->btn', vid_feat, phrase_slot) # [B, T, N]
-        empty_vid_mask = ~(vid_mask.bool()).unsqueeze(-1)
-        masked_dot_product = torch.where(empty_vid_mask, 
-                                        torch.tensor(float('-inf')).to(dot_product.device), 
-                                        dot_product)
-        masked_dot_product = masked_dot_product.permute(0, 2, 1) # [B, N, T]
-        # Apply temperature-scaled softmax
-        softmax_output = F.softmax(masked_dot_product / self.tau, dim=2)
-        keyphrase_weight = torch.max(softmax_output, dim=2)[0]
+        self.phrase_proj = nn.Linear(hdim, hdim * rank)
 
-        
-        return keyphrase_weight
-    
+        self.kernel_params = nn.ParameterDict()
+        for k in t_kernels:
+            self.kernel_params[f'k{k}'] = nn.Parameter(
+                torch.randn(rank, hdim, k)
+            )
 
-class PhraseWeight_eos(nn.Module):
-    def __init__(self, hdim):
-        super(PhraseWeight_eos, self).__init__()
-        self.q = nn.Linear(hdim, hdim)
-        self.k = nn.Linear(hdim, hdim)
-    def forward(self, phrase_slot, eos_emb):
-        # Compute attention weights
-        c = phrase_slot.shape[2]
-        eos_q = self.q(eos_emb) # [B, 1, C]
-        phrase_k = self.k(phrase_slot) # [B, N, C]
-        dot_product = torch.einsum('blc,bnc->bln', eos_q, phrase_k) # [B, 1 N]
-        # Apply temperature-scaled softmax
-        softmax_output = F.softmax(dot_product / math.sqrt(c), dim=2)
-        return softmax_output.squeeze(1) # [B, N]
+        self.linear_out = nn.Linear(len(t_kernels) * hdim, hdim)
+        self.norm = nn.LayerNorm(hdim)
+        self.act = nn.ReLU()
+
+    def temporal_unfold(self, x, kernel_size, padding):
+        # x: (B, T, N, C)
+        B, T, N, C = x.shape
+        pad = (kernel_size // 2) if padding else 0
+
+        # Padding Temporal Axis
+        x_padded = F.pad(x, (0, 0, 0, 0, pad, pad))  # Pad only T axis: (B, T + 2*pad, N, C)
+
+        # Using as_strided for efficient sliding window
+        T_new = T
+        x_stride = x_padded.stride()
+        x_window = x_padded.as_strided(
+            size=(B, T_new, kernel_size, N, C),
+            stride=(x_stride[0], x_stride[1], x_stride[1], x_stride[2], x_stride[3])
+        )
+        return x_window  # (B, T, K, N, C)
+
+    def forward(self, context_emb, phrase_emb):
+        B, T, N, C = context_emb.shape
+        outputs = []
+
+        # 1️⃣ Phrase Projection & Dynamic Kernel 생성
+        phrase_proj = self.phrase_proj(phrase_emb).view(B, N, C, self.rank)  # (B, N, C, r)
+
+        for k in self.t_kernels:
+            kernel_param = self.kernel_params[f'k{k}']  # (r, C_out, K)
+            dynamic_kernel = torch.einsum('bncr, rdk -> bnckd', phrase_proj, kernel_param)  # (B, N, C, K, C_out)
+
+            x_window = self.temporal_unfold(context_emb, k, padding=True)  # (B, T, K, N, C)
+            # x_window: (B, T, K, N, C)
+            # dynamic_kernel: (B, N, C, K, C_out)
+
+            x_window = rearrange(x_window, 'b t k n c -> b t (k n c)')
+            dynamic_kernel = rearrange(dynamic_kernel, 'b n c k d -> b (k n c) d ')
+            out = torch.bmm(x_window, dynamic_kernel) # (B, T, C)
+            outputs.append(out)
+
+        # 4️⃣ Concat & Final Projection
+        output = torch.cat(outputs, dim=-1)   # (B, T, len(kernels)*C_out)
+        output = self.act(self.norm(self.linear_out(output)))
+
+        return output
+
+
+
     
 class PhraseContextLayer(nn.Module):
     def __init__(self, hdim, nheads, dropout=0.1):
@@ -271,31 +300,30 @@ class PhraseContextLayer(nn.Module):
         context_emb, _ = self.t_att(context_emb, vid_mask) # [B*N, T, C]
         t_update = self.fc_t(context_emb) # [B*N, T, C]
         context_emb = self.norm_t(context_emb + t_update) # [B*N, T, C]
-        context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B*T, N, C]
+        #context_emb = rearrange(context_emb, '(b n) t c -> b t n c', b=B, n=N)
+        #context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B*T, N, C]
         # N-axis self-attention
-        context_att, _ = self.n_att(context_emb, None) # [B*T,N,C]
-        context_emb = rearrange(context_att, '(b t) n c -> (b n) t c', b=B, n=N) # [B*N, T, C]
-        n_update = self.fc_n(context_emb)
-        context_emb = self.norm_n(context_emb + n_update)
+        #context_att, _ = self.n_att(context_emb, None) # [B*T,N,C]
+        #context_emb = rearrange(context_att, '(b t) n c -> (b n) t c', b=B, n=N) # [B*N, T, C]
+        #n_update = self.fc_n(context_emb)
+        #context_emb = self.norm_n(context_emb + n_update)
 
         return context_emb
 
 
 class Phrase_Context(nn.Module):
-    def __init__(self, hdim, nheads, dropout=0.1, num_layers=2, product_idim_1=None, product_idim_2=None):
+    def __init__(self, hdim, nheads, dropout=0.1, num_phrase=3, rank=32, t_kernels=(1,3,5), num_layers=2):
         super(Phrase_Context, self).__init__()
         self.hdim = hdim
         self.num_layers = num_layers
         self.layers = nn.ModuleList([PhraseContextLayer(hdim, nheads, dropout) for _ in range(num_layers)])
         self.dropout = nn.Dropout(dropout)
+        self.rank = rank
 
-        if product_idim_1 is None:
-            product_idim_1 = hdim
-        if product_idim_2 is None:
-            product_idim_2 = hdim
 
-        self.product = HadamardProduct(product_idim_1, product_idim_2, hdim)
+        self.product = HadamardProduct(hdim, hdim, hdim)
         self.pos = PositionEmbeddingSine(hdim)
+        self.local_context = LowRankDynamicConv(hdim, num_phrase, rank, t_kernels)
 
     def forward(self, phrase_slot, vid_feat, vid_mask):
         """
@@ -317,8 +345,9 @@ class Phrase_Context(nn.Module):
 
         for layer in self.layers:
             context_emb = layer(context_emb, vid_mask, (B, N, T, C))
-        updated_phrase = rearrange(context_emb, '(b n) t c -> b n t c', b=B, n=N) # [B, N, T, C]
-        return updated_phrase
+        context_emb = rearrange(context_emb, '(b n) t c -> b t n c', b=B, n=N)
+        context_agg = self.local_context(context_emb, phrase_slot)
+        return context_agg
 
 
 class PhraseContextLayerv2(nn.Module):
@@ -573,7 +602,6 @@ class EntropyGating(nn.Module):
         valid_lengths = mask.sum(dim=1)
         entropy = entropy / torch.log(valid_lengths)
         entropy = torch.clamp(entropy, min=0.0, max=1.0)
-        print('entropy', entropy[:3])
 
         return entropy.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
     
