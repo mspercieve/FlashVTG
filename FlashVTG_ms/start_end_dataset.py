@@ -439,7 +439,7 @@ class StartEndDataset(Dataset):
             except:
                 q_feat_path = join(self.q_feat_dir, f"{qid}.npy")
                 q_feat = np.load(q_feat_path).astype(np.float32)
-                q_feat = np.concatenate([q_feat[-1:], q_feat[:-1]], axis=0) # Ensure the first token is the [EOS] token
+                q_feat = np.concatenate([q_feat[-1:], q_feat[4:-1]], axis=0) # Ensure the first token is the [EOS] token
                 if self.q_feat_type == "last_hidden_state":
                     q_feat = q_feat[:self.max_q_l]
                 if self.normalize_t:

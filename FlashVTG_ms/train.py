@@ -182,7 +182,8 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                         pprint.pformat(metrics_nms["brief"], indent=4)
                     )
                 )
-
+                with open(opt.eval_log_filepath, "a") as f:
+                    f.write("metrics_nms {}\n".format(pprint.pformat(metrics_nms["brief"], indent=4)))
             metrics = metrics_no_nms
             for k, v in metrics["brief"].items():
                 tb_writer.add_scalar(f"Eval/{k}", float(v), iteration)

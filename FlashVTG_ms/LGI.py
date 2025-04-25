@@ -128,6 +128,7 @@ class Phrase_Generate(nn.Module):
         self.num_layers = num_layers
         self.phrase_att = nn.ModuleList([SlotAttention(num_phrase, hdim, num_heads, drop_p) for _ in range(num_layers)])
         self.sqan = SequentialQueryAttention(num_phrase, hdim)
+        self.pos = PositionEmbeddingSine(hdim)
     def forward(self, txt_emb, txt_mask):
         """
         Args:
@@ -139,12 +140,13 @@ class Phrase_Generate(nn.Module):
         """
 
         B, L, C = txt_emb.shape
-        stc_emb, phrase_emb = torch.split(txt_emb, [1, L-1], dim=1)
-        phrase_mask = txt_mask[:, 1:] # [B, L-1]
-        phrase_slot, phrase_attn = self.sqan(stc_emb, phrase_emb, phrase_mask) # [B, N, C]
-        
+        stc_emb, word_emb = torch.split(txt_emb, [1, L-1], dim=1)
+        word_mask = txt_mask[:, 1:] # [B, L-1]
+        phrase_slot, phrase_attn = self.sqan(stc_emb, word_emb, word_mask) # [B, N, C]
+        word_pos = self.pos(word_emb, word_mask)
+        word_pe = word_emb + word_pos
         for i in range(self.num_layers):
-            phrase_slot = self.phrase_att[i](txt_emb, txt_mask, phrase_slot)
+            phrase_slot = self.phrase_att[i](word_pe, word_mask, phrase_slot)
             
         return phrase_slot, phrase_attn
 
@@ -474,61 +476,7 @@ class CrossAttention(nn.Module):
         update = self.dropout1(self.act(self.linear(x)))
         x = self.norm1(x + update)
         return x, attn
-    
-class AttentivePooling(nn.Module):
-    def __init__(self, embed_dim):
-        """
-        Args:
-            embed_dim (int): embedding dimension of the phrases
-        """
-        super(AttentivePooling, self).__init__()
-        self.attn_weight = nn.Parameter(torch.randn(embed_dim, 1))
 
-    def forward(self, x):
-        """
-        Args:
-            x: Tensor of shape [B, N, T, C]
-        Returns:
-            out: Tensor of shape [B, T, C]
-            weighted sum of phrases
-        """
-        B, N, T, C = x.size()
-        x = x.permute(0, 2, 1, 3).contiguous()  # [B, T, N, C]
-        x_reshaped = x.view(B * T, N, C)  # [B*T, N, C]
-
-        scores = torch.matmul(x_reshaped, self.attn_weight) # [B*T, N, 1]
-        scores = scores.squeeze(-1)  # [B*T, N]
-
-        attn_scores = F.softmax(scores, dim=-1)  # [B*T, N]
-        attn_scores = attn_scores.unsqueeze(-1)   # [B*T, N, 1]
-        pooled = torch.sum(x_reshaped * attn_scores, dim=1)  # [B*T, C]
-
-        out = pooled.view(B, T, C)
-        return out
-    
-class Context_Aggregate(nn.Module):
-    def __init__(self, hdim):
-        super(Context_Aggregate, self).__init__()
-        
-        self.hdim = hdim
-        self.linear = nn.Linear(hdim, hdim)
-        self.norm = nn.LayerNorm(hdim)
-        self.dropout = nn.Dropout(0.1)
-        self.act = nn.ReLU()
-
-    def forward(self, weight, context_emb):
-        """
-        Args:
-            weight: [B, N]
-            context_emb: [B, N, T, C]
-        Returns:
-            context_agg: [B, T, C]
-        """
-        B, N, T, C = context_emb.shape
-        weight = weight.unsqueeze(-1).unsqueeze(-1) # [B, N, 1, 1]
-        context_agg = torch.sum(context_emb * weight, dim=1) # [B, T, C]
-        context_agg = self.norm(self.dropout(self.act(self.linear(context_agg)))) # [B, T, C]
-        return context_agg
     
 class LowRankDynamicProjector(nn.Module):
     def __init__(self, hdim, r):

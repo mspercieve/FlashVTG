@@ -171,7 +171,6 @@ class FlashVTG_ms(nn.Module):
         src_vid = src_vid + self.token_type_embeddings(torch.full_like(src_vid_mask.long(), 1))
         src_txt = src_txt + self.token_type_embeddings(torch.zeros_like(src_txt_mask.long()))
         # Add position embeddings
-
         pos_vid = self.position_embed(src_vid, src_vid_mask)
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
         # separate sentence and word
@@ -201,8 +200,6 @@ class FlashVTG_ms(nn.Module):
 
         # global text update
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
-        t2vattnvalues = (attn_weights[:,:,self.args.num_dummies:]).sum(2)
-        
         src_emb = context_agg + vid_emb
         src_emb = src_emb + pos_vid
         src_emb = self.t_sa(src_emb, src_vid_mask)
@@ -424,8 +421,8 @@ def build_model1(args):
         args=args
     )
 
-    weight_dict = {"loss_label": args.label_loss_coef,
-                   # "loss_label": 0,
+    weight_dict = {#"loss_label": args.label_loss_coef,
+                    "loss_label": 0,
                    "loss_saliency": args.lw_saliency,
                    'loss_reg': args.lw_reg,
                    "loss_cls": args.lw_cls,
