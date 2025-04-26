@@ -421,8 +421,7 @@ def build_model1(args):
         args=args
     )
 
-    weight_dict = {#"loss_label": args.label_loss_coef,
-                    "loss_label": 0,
+    weight_dict = {"loss_label": args.label_loss_coef,
                    "loss_saliency": args.lw_saliency,
                    'loss_reg': args.lw_reg,
                    "loss_cls": args.lw_cls,

@@ -421,6 +421,9 @@ def eval_epoch(
         metrics, metrics_nms, latest_file_paths = eval_epoch_post_processing(
             submission, opt, eval_dataset.data, save_submission_filename
         )
+        if tb_writer is not None and metrics_nms is not None:
+            for k, v in metrics_nms["brief"].items():
+                tb_writer.add_scalar(f"Eval_NMS/{k}", v, epoch_i + 1)
         return metrics, metrics_nms, eval_loss_meters, latest_file_paths
 
 

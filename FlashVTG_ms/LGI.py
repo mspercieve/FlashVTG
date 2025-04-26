@@ -146,7 +146,7 @@ class Phrase_Generate(nn.Module):
         word_pos = self.pos(word_emb, word_mask)
         word_pe = word_emb + word_pos
         for i in range(self.num_layers):
-            phrase_slot = self.phrase_att[i](txt_emb, txt_mask, phrase_slot)
+            phrase_slot = self.phrase_att[i](word_pe, word_mask, phrase_slot)
             
         return phrase_slot, phrase_attn
 
@@ -214,7 +214,7 @@ class LowRankDynamicConv(nn.Module):
         self.rank = rank
         self.t_kernels = t_kernels
 
-        self.phrase_proj = nn.Linear(hdim, hdim * rank)
+        self.phrase_proj = nn.Linear(num_phrase * hdim, num_phrase * hdim * rank)
 
         self.kernel_params = nn.ParameterDict()
         for k in t_kernels:
@@ -225,7 +225,8 @@ class LowRankDynamicConv(nn.Module):
         self.linear_out = nn.Linear(len(t_kernels) * hdim, hdim)
         self.norm = nn.LayerNorm(hdim)
         self.act = nn.ReLU()
-
+        self.dropout = nn.Dropout(0.1)
+        
     def temporal_unfold(self, x, kernel_size, padding):
         # x: (B, T, N, C)
         B, T, N, C = x.shape
@@ -248,6 +249,7 @@ class LowRankDynamicConv(nn.Module):
         outputs = []
 
         # 1️⃣ Phrase Projection & Dynamic Kernel 생성
+        phrase_emb = phrase_emb.view(B, N*C)
         phrase_proj = self.phrase_proj(phrase_emb).view(B, N, C, self.rank)  # (B, N, C, r)
 
         for k in self.t_kernels:
@@ -265,7 +267,7 @@ class LowRankDynamicConv(nn.Module):
 
         # 4️⃣ Concat & Final Projection
         output = torch.cat(outputs, dim=-1)   # (B, T, len(kernels)*C_out)
-        output = self.act(self.norm(self.linear_out(output)))
+        output = self.act(self.norm(self.dropout(self.linear_out(output))))
 
         return output
 
