@@ -144,7 +144,7 @@ class FlashVTG_ms(nn.Module):
 
         # build phrase embedding
         self.phrase_generate = Phrase_Generate(args.num_phrase, hidden_dim, args.nheads, args.dropout, args.phrase_layers)
-        self.phrase_context = Phrase_Context(hidden_dim, args.nheads, args.dropout, args.context_layers)
+        self.phrase_context = Phrase_Context(hidden_dim, args.context_layers, args.nheads, args.dropout, args.num_phrase, args.rank, t_kernels=(1,3,5), )
         #self.phrase_context = Phrase_Contextv2(hidden_dim, args.nheads, args.dropout, args.context_layers)
         self.context_proj = LowRankDynamicProjector(hidden_dim, r=args.rank)
         self.gate = EntropyGating()

@@ -226,7 +226,7 @@ class LowRankDynamicConv(nn.Module):
         self.norm = nn.LayerNorm(hdim)
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(0.1)
-        
+
     def temporal_unfold(self, x, kernel_size, padding):
         # x: (B, T, N, C)
         B, T, N, C = x.shape
@@ -250,7 +250,8 @@ class LowRankDynamicConv(nn.Module):
 
         # 1️⃣ Phrase Projection & Dynamic Kernel 생성
         phrase_emb = phrase_emb.view(B, N*C)
-        phrase_proj = self.phrase_proj(phrase_emb).view(B, N, C, self.rank)  # (B, N, C, r)
+        phrase_proj = self.phrase_proj(phrase_emb)
+        phrase_proj = rearrange(phrase_proj, 'b (n c r) -> b n c r', n=N, c=C, r=self.rank)
 
         for k in self.t_kernels:
             kernel_param = self.kernel_params[f'k{k}']  # (r, C_out, K)
@@ -314,7 +315,7 @@ class PhraseContextLayer(nn.Module):
 
 
 class Phrase_Context(nn.Module):
-    def __init__(self, hdim, nheads, dropout=0.1, num_phrase=3, rank=32, t_kernels=(1,3,5), num_layers=2):
+    def __init__(self, hdim, num_layers, nheads, dropout=0.1, num_phrase=3, rank=32, t_kernels=(1,3,5)):
         super(Phrase_Context, self).__init__()
         self.hdim = hdim
         self.num_layers = num_layers
