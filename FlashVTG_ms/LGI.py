@@ -7,6 +7,8 @@ import net_utils
 import math
 from position_encoding import PositionEmbeddingSine
 from einops import rearrange, repeat
+from natten.functional import natten2dqkrpb, natten2dav
+
 
 class Attention(nn.Module):
     def __init__(self, kdim, cdim, hdim, drop_p):
@@ -214,8 +216,8 @@ class LowRankDynamicConv(nn.Module):
         self.rank = rank
         self.t_kernels = t_kernels
 
-        self.phrase_proj = nn.Linear(num_phrase * hdim, num_phrase * hdim * rank)
-
+        #self.phrase_proj = nn.Linear(num_phrase * hdim, num_phrase * hdim * rank)
+        self.phrase_proj = nn.Linear(hdim, hdim * rank)
         self.kernel_params = nn.ParameterDict()
         for k in t_kernels:
             self.kernel_params[f'k{k}'] = nn.Parameter(
@@ -249,9 +251,12 @@ class LowRankDynamicConv(nn.Module):
         outputs = []
 
         # 1️⃣ Phrase Projection & Dynamic Kernel 생성
-        phrase_emb = phrase_emb.view(B, N*C)
+        #phrase_emb = phrase_emb.view(B, N*C)
+        #phrase_proj = self.phrase_proj(phrase_emb)
+        #phrase_proj = rearrange(phrase_proj, 'b (n c r) -> b n c r', n=N, c=C, r=self.rank)
+
         phrase_proj = self.phrase_proj(phrase_emb)
-        phrase_proj = rearrange(phrase_proj, 'b (n c r) -> b n c r', n=N, c=C, r=self.rank)
+        phrase_proj = rearrange(phrase_proj, 'b n (c r) -> b n c r', c=C, r=self.rank)
 
         for k in self.t_kernels:
             kernel_param = self.kernel_params[f'k{k}']  # (r, C_out, K)
@@ -272,8 +277,121 @@ class LowRankDynamicConv(nn.Module):
 
         return output
 
+class ContextNAT_dynamic(nn.Module):
+    def __init__(self, hdim, nheads, k_size, rank, dropout=0.1):
+        super(ContextNAT_dynamic, self).__init__()
+        self.hdim = hdim
+        self.nheads = nheads
+        self.rank = rank
+        # low-rank dynamic projection
+        self.q_phrase_proj = nn.Linear(hdim, hdim * rank)
+        self.k_phrase_proj = nn.Linear(hdim, hdim * rank)
+        self.v_phrase_proj = nn.Linear(hdim, hdim * rank)
+
+        # shared low-rank parameter
+        self.q_shared = nn.Parameter(torch.randn(rank, hdim))  # [r,C]
+        self.k_shared = nn.Parameter(torch.randn(rank, hdim))
+        self.v_shared = nn.Parameter(torch.randn(rank, hdim))
+
+        self.k_size = k_size
+
+        self.att = nn.MultiheadAttention(hdim, nheads, batch_first=True, dropout=dropout)
+        self.norm = nn.LayerNorm(hdim)
+        self.dropout = nn.Dropout(dropout)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(hdim, hdim * 4),
+            nn.ReLU(),
+            nn.Linear(hdim *4, hdim),
+            nn.Dropout(dropout)
+        )
+        self.norm_f = nn.LayerNorm(hdim)
+
+    def t_unfold(self, emb, mask, kernel_size):
+        B, T, N, C = emb.shape
+        pad = kernel_size // 2
+
+        feat_padded = F.pad(emb, (0, 0, 0, 0, pad, pad))   # Pad T axis: [B, T+2p, N, C]
+        mask_padded = F.pad(mask,   (0, 0, pad, pad), value=0) # Pad T axis: [B, T+2p, N]
+
+        feat_stride = feat_padded.stride()
+        unfolded_feat = feat_padded.as_strided(
+            size=(B, T, N, kernel_size, C),
+            stride=(feat_stride[0], feat_stride[1], feat_stride[2], feat_stride[1], feat_stride[3])
+        )   # [B, T, N, K, C]
+
+        mask_stride = mask_padded.stride()
+        unfolded_mask = mask_padded.as_strided(
+            size=(B, T, N, kernel_size),
+            stride=(mask_stride[0], mask_stride[1], mask_stride[2], mask_stride[1])
+        )   # [B, T, N, K]
+
+        # insure self index = 1
+        unfolded_mask[:, :, :, pad] = 1
+
+        return unfolded_feat, unfolded_mask        
+
+    def make_dyn_proj(self, phrase_emb, shared_param, proj_layer):
+        """
+        phrase_emb: [B, N, C]
+        returns: [B, N, C, C]
+        """
+        B, N, C = phrase_emb.shape
+        dyn = proj_layer(phrase_emb).view(B, N, C, self.rank)         # [B,N,C,r]
+        dyn = torch.matmul(dyn, shared_param)                         # [B,N,C,C]
+        return dyn
+
+    def apply_dyn_proj(self, x, dyn_weight):
+        """
+        x:          [B, T, N, C]
+        dyn_weight: [B, N, C, C]
+        returns:    [B, T, N, C]
+        """
+        return torch.einsum('btnc,bncd->btnd', x, dyn_weight)
 
 
+    def forward(self, context_emb, phrase_emb, vid_mask):
+        """
+        Args:
+            context_emb: [B, T, N, C]
+            phrase_emb: [B, N, C]
+            vid_mask: [B, T]
+        Returns:
+            updated_phrase: [B, T, N, C]
+        """
+        B, T, N, C = context_emb.shape
+
+        # 1) dynamic projection weights [B,N,C,C]
+        q_dyn = self.make_dyn_proj(phrase_emb, self.q_shared, self.q_phrase_proj)
+        k_dyn = self.make_dyn_proj(phrase_emb, self.k_shared, self.k_phrase_proj)
+        v_dyn = self.make_dyn_proj(phrase_emb, self.v_shared, self.v_phrase_proj)
+
+        # 2) apply dynamic projection BEFORE unfolding
+        context_emb_q = self.apply_dyn_proj(context_emb, q_dyn)  # [B, T, N, C]
+        context_emb_k = self.apply_dyn_proj(context_emb, k_dyn)
+        context_emb_v = self.apply_dyn_proj(context_emb, v_dyn)
+
+        # 3) unfold projected feature
+        unfold_k, unfold_mask = self.t_unfold(context_emb_k, vid_mask, self.k_size)  # [B, T, N, K, C]
+        unfold_v, _            = self.t_unfold(context_emb_v, vid_mask, self.k_size)
+
+        # 4) rearrange for attention
+        context_emb_q = rearrange(context_emb_q, 'b t n c -> (b t) n c')
+        unfold_k = rearrange(unfold_k, 'b t n k c -> (b t) (n k) c')
+        unfold_v = rearrange(unfold_v, 'b t n k c -> (b t) (n k) c')
+        unfold_mask = rearrange(unfold_mask, 'b t n k -> (b t) (n k)')
+
+        # 5) attention
+        update = self.att(context_emb_q, unfold_k, unfold_v, key_padding_mask=~(unfold_mask.bool()))[0]
+        context_emb = self.norm(context_emb_q + self.dropout(update))
+
+        # 6) FFN
+        context_emb = self.norm_f(self.ffn(context_emb) + context_emb)
+
+        # 7) reshape back
+        context_emb = rearrange(context_emb, '(b t) n c -> b t n c', b=B, t=T)
+
+        return context_emb
     
 class PhraseContextLayer(nn.Module):
     def __init__(self, hdim, nheads, dropout=0.1):
@@ -352,46 +470,20 @@ class Phrase_Context(nn.Module):
         context_agg = self.local_context(context_emb, phrase_slot)
         return context_agg
 
-
-class PhraseContextLayerv2(nn.Module):
-    def __init__(self, hdim, nheads, dropout=0.1, type='t'):
-        super(PhraseContextLayerv2, self).__init__()
-        self.att = SelfAttention(hdim, nheads, dropout=dropout)
-
-        self.fc = nn.Sequential(
-            nn.Linear(hdim, hdim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.norm = nn.LayerNorm(hdim)
-        self.norm_n = nn.LayerNorm(hdim)
-
-    def forward(self, context_emb, vid_mask=None):
-        """
-        context_emb: [B*N, T, C]
-        """
-        context_emb, _ = self.att(context_emb, vid_mask) # [B*N, T, C]
-        update = self.fc(context_emb)
-        context_emb = self.norm(context_emb + update)
-        return context_emb
-
-
-class Phrase_Contextv2(nn.Module):
-    def __init__(self, hdim, nheads, dropout=0.1, num_layers=2, product_idim_1=None, product_idim_2=None):
-        super(Phrase_Contextv2, self).__init__()
+class PhraseContext_NAT(nn.Module):
+    def __init__(self, hdim, num_layers, nheads, dropout=0.1, num_phrase=3, rank=32, t_kernels=(3,5,7)):
+        super(PhraseContext_NAT, self).__init__()
         self.hdim = hdim
         self.num_layers = num_layers
+        self.layers = nn.ModuleList([ContextNAT_dynamic(hdim, nheads, k_size=t, rank=rank, dropout=dropout) for t in t_kernels])
         self.dropout = nn.Dropout(dropout)
-        self.t_layers = nn.ModuleList([PhraseContextLayerv2(hdim, nheads, dropout, type='t') for _ in range(num_layers)])
-        self.n_layers = nn.ModuleList([PhraseContextLayerv2(hdim, nheads, dropout, type='n') for _ in range(num_layers)])
-        if product_idim_1 is None:
-            product_idim_1 = hdim
-        if product_idim_2 is None:
-            product_idim_2 = hdim
+        self.rank = rank
 
-        self.product = HadamardProduct(product_idim_1, product_idim_2, hdim)
+
+        self.product = HadamardProduct(hdim, hdim, hdim)
         self.pos = PositionEmbeddingSine(hdim)
-        
+        self.context_agg = LowRankDynamicProjector(hdim, rank)
+
     def forward(self, phrase_slot, vid_feat, vid_mask):
         """
         Args:
@@ -403,21 +495,18 @@ class Phrase_Contextv2(nn.Module):
         B, T, C = vid_feat.shape
         N = phrase_slot.shape[1]
         
-        context_emb = self.product([phrase_slot, vid_feat]) # [ B, N, T, C]
-        context_emb = rearrange(context_emb, 'b n t c -> (b n) t c') # [B*N, T, C]
-        
-        vid_mask = repeat(vid_mask, 'b t -> (b n) t', n=N) # [B*N, T]
-        pos = self.pos(context_emb, vid_mask) # [B*N, T, C]
+        context_emb = self.product([vid_feat, phrase_slot]) # [B T N C]
+        pos = self.pos(vid_feat, vid_mask) # B T C
+        pos = pos.unsqueeze(2).expand(-1, -1, N, -1)
         context_emb = context_emb + pos
+        vid_mask = vid_mask.unsqueeze(-1).expand(-1, -1, N)
 
-        # t first, then n
-        for t_layer in self.t_layers:
-            context_emb = t_layer(context_emb, vid_mask)
-        context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B, T, N, C]')
-        for n_layer in self.n_layers:
-            context_emb = n_layer(context_emb, None)
-        updated_phrase = rearrange(context_emb, '(b t) n c -> b n t c', b=B, t=T) # [B, N, T, C]
-        return updated_phrase
+        for layer in self.layers:
+            context_emb = layer(context_emb, phrase_slot, vid_mask) # B T N C
+
+        context_agg = self.context_agg(phrase_slot, context_emb)
+        return context_agg    
+
 
 class HadamardProduct(nn.Module):
     def __init__(self, idim_1, idim_2, hdim):
@@ -527,7 +616,7 @@ class LowRankDynamicProjector(nn.Module):
         context_emb: [B, T, N*C]
         """
         B, N, C = phrase_emb.shape
-        context_emb = rearrange(context_emb, 'b n t c -> b t (n c)')  # [B, T, N*C]
+        context_emb = rearrange(context_emb, 'b t n c -> b t (n c)')  # [B, T, N*C]
         # 1. Generate Low-Rank Kernel
         dyn_kernel = self.proj_phrase(phrase_emb).view(B, N, C, self.r)   # [B, N, C, r]
         dyn_kernel = torch.matmul(dyn_kernel, self.shared_param)          # [B, N, C, C]

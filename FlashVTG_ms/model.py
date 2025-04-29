@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, T_SA, Phrase_Context, Phrase_Contextv2, LowRankDynamicProjector, EntropyGating, Saliency_proj
+from LGI import Phrase_Generate, T_SA, Phrase_Context, PhraseContext_NAT, LowRankDynamicProjector, EntropyGating, Saliency_proj
 from einops import rearrange
 
 def init_weights(module):
@@ -144,8 +144,8 @@ class FlashVTG_ms(nn.Module):
 
         # build phrase embedding
         self.phrase_generate = Phrase_Generate(args.num_phrase, hidden_dim, args.nheads, args.dropout, args.phrase_layers)
-        self.phrase_context = Phrase_Context(hidden_dim, args.context_layers, args.nheads, args.dropout, args.num_phrase, args.rank, t_kernels=(1,3,5), )
-        #self.phrase_context = Phrase_Contextv2(hidden_dim, args.nheads, args.dropout, args.context_layers)
+        #self.phrase_context = Phrase_Context(hidden_dim, args.context_layers, args.nheads, args.dropout, args.num_phrase, args.rank, t_kernels=(1,3,5))
+        self.phrase_context = PhraseContext_NAT(hidden_dim, args.context_layers, args.nheads, args.dropout, args.num_phrase, args.rank, t_kernels=(3,5,7))
         self.context_proj = LowRankDynamicProjector(hidden_dim, r=args.rank)
         self.gate = EntropyGating()
         self.t_sa = T_SA(hidden_dim, args.nheads, args.dropout, num_layers=args.t_sa)
@@ -201,8 +201,8 @@ class FlashVTG_ms(nn.Module):
         # global text update
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
         src_emb = context_agg + vid_emb
-        src_emb = src_emb + pos_vid
-        src_emb = self.t_sa(src_emb, src_vid_mask)
+        #src_emb = src_emb + pos_vid
+        #src_emb = self.t_sa(src_emb, src_vid_mask)
         
         saliency_scores = self.saliency_proj(src_emb.clone())
         video_msk = (~video_msk).int()
@@ -321,8 +321,8 @@ class FlashVTG_ms(nn.Module):
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 
                 vid_mem_neg = context_agg_neg + memory_neg
-                vid_mem_neg = vid_mem_neg + pos_vid_neg
-                vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
+                #vid_mem_neg = vid_mem_neg + pos_vid_neg
+                #vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
                 
                 saliency_scores_neg = self.saliency_proj(vid_mem_neg.clone())
                 output["saliency_scores_neg"] = saliency_scores_neg
