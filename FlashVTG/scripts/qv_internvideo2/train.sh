@@ -1,7 +1,7 @@
 dset_name=qv_internvideo2
 ctx_mode=video_tef
 v_feat_types=internvideo2
-t_feat_type=llama
+t_feat_type=internvideo2
 results_root=results
 exp_id=demo
 
@@ -11,14 +11,25 @@ eval_path=data/highlight_val_release.jsonl
 eval_split_name=val
 
 ######## setup video+text features
+feat_root='/SSD1/minseok/MR_HD/DB'
+
 # video features
-v_feat_dirs=/home/caozhuo/data_ssd/qvhighlights_internvideo2/qvhighlight_6b/
-v_feat_dim=768
+v_feat_dim=0
+v_feat_dirs=()
+
+if [[ ${v_feat_types} == *"internvideo2"* ]]; then
+  v_feat_dirs+=(${feat_root}/features/internvid_features/qvhighlights/stage2_video/qvhighlight_6b/)
+  (( v_feat_dim += 768))
+fi
 
 # text features
-t_feat_dir=/home/caozhuo/data_ssd/qvhighlights_internvideo2/qvhighlight_llama_text_feature/
-t_feat_dim=4096
-
+if [[ ${t_feat_type} == "internvideo2" ]]; then
+  t_feat_dir=${feat_root}/features/internvid_features/qvhighlights/text/
+  t_feat_dim=4096
+else
+  echo "Wrong arg for t_feat_type."
+  exit 1
+fi
 #### training
 bsz=64
 max_v_l=75
