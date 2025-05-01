@@ -112,7 +112,16 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
         logger.info("CUDA enabled.")
         model.to(opt.device)
 
-    wandb.init(project="FlashVTG", entity="msperceive", sync_tensorboard=True)
+    N_phrase = opt.num_phrase
+    N_layer = opt.phrase_layers
+    C_layer = opt.context_layers
+    rank = opt.rank
+
+    contribution = "DynamicConvV2"
+
+    run_name = f"{contribution}_Nphrase{N_phrase}_Nlayer{N_layer}_Clayer{C_layer}_rank{rank}"
+
+    wandb.init(project="FlashVTG", name = run_name, entity="msperceive", sync_tensorboard=True)
     tb_writer = SummaryWriter(log_dir=wandb.run.dir)
     tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"

@@ -314,7 +314,6 @@ class FlashVTG_ms(nn.Module):
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 
                 vid_mem_neg = context_agg_neg + memory_neg
-
                 saliency_scores_neg = self.saliency_proj(vid_mem_neg.clone())
                 output["saliency_scores_neg"] = saliency_scores_neg
                 output["src_txt_mask_neg"] = src_txt_mask_dummy_neg

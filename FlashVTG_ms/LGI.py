@@ -282,8 +282,8 @@ class LowRankDynamicConv(nn.Module):
 class PhraseContextLayer(nn.Module):
     def __init__(self, hdim, nheads, dropout=0.1):
         super(PhraseContextLayer, self).__init__()
-        #self.n_att = SelfAttention(hdim, nheads, dropout=dropout)
-        self.n_att = SelfAttention_Dynamic(hdim, nheads, rank=32, dropout=dropout)
+        self.n_att = SelfAttention(hdim, nheads, dropout=dropout)
+        #self.n_att = SelfAttention_Dynamicv2(hdim, nheads, k=64, dropout=dropout)
         self.t_att = SelfAttention(hdim, nheads, dropout=dropout)
 
         self.fc_t = nn.Sequential(
@@ -310,7 +310,8 @@ class PhraseContextLayer(nn.Module):
         context_emb = self.norm_t(context_emb + t_update) # [B*N, T, C]
         context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B*T, N, C]
         # N-axis self-attention
-        context_att, _ = self.n_att(context_emb, phrase_emb, None) # [B*T,N,C]
+        context_att, _ = self.n_att(context_emb)
+        #context_att, _ = self.n_att(context_emb, phrase_emb, None) # [B*T,N,C]
         context_emb = rearrange(context_att, '(b t) n c -> (b n) t c', b=B, n=N) # [B*N, T, C]
         n_update = self.fc_n(context_emb)
         context_emb = self.norm_n(context_emb + n_update)
@@ -408,51 +409,61 @@ class SelfAttention(nn.Module):
         x = self.norm(x + update)
         return x, attn
 
-
-class SelfAttention_Dynamic(nn.Module):
-    def __init__(self, hdim, nheads, rank, dropout=0.1):
-        super(SelfAttention_Dynamic, self).__init__()
+class SelfAttention_Dynamicv2(nn.Module):
+    """
+    Self-Attention with Dynamic Projection v2
+    Mixture of Experts (MoE) 방식으로 Q, K에 dynamic projection 적용
+    """
+    def __init__(self, hdim, nheads, k, dropout=0.1):
+        super(SelfAttention_Dynamicv2, self).__init__()
         self.hdim = hdim
         self.nheads = nheads
-        self.rank = rank
+        self.k = k
 
         self.att = nn.MultiheadAttention(hdim, nheads, batch_first=True, dropout=dropout)
 
-        # Dynamic projection 생성
-        self.shared_param = nn.Parameter(torch.randn(rank, 3 * hdim))  # [r, 3C]
-        self.dyn_proj = nn.Linear(hdim, hdim * rank)  # [C] → [C * r]
+        self.q_experts = nn.Parameter(torch.randn(k, hdim, hdim))
+        self.k_experts = nn.Parameter(torch.randn(k, hdim, hdim))
+
+        # gating projection (from phrase embedding)
+        self.dyn_proj = nn.Linear(hdim, k)  # phrase -> expert weight
+
+        # v는 고정 projection
+        self.v_proj = nn.Linear(hdim, hdim)
 
         self.norm = nn.LayerNorm(hdim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, y, mask=None):
         """
-        x: [B*T, L, C]
-        y: [B, L, C]  → phrase input for dynamic projection
+        x: [B*T, N, C] (video-phrase context)
+        y: [B, N, C]   (phrase)
+        mask: [B*T, N]
         """
-        BT, L, C = x.shape
+        BT, N, C = x.shape
         B = y.shape[0]
         T = BT // B
 
-        # 1. Phrase-based dynamic kernel 생성
-        dyn_kernel = self.dyn_proj(y).view(B, L, C, self.rank)         # [B, L, C, r]
-        dyn_kernel = torch.matmul(dyn_kernel, self.shared_param)       # [B, L, C, 3C]
-        dyn_kernel = dyn_kernel.view(B, L, 3, C, C)                    # [B, L, 3, C, C]
+        # 1. Gating: [B, N, k]
+        dyn = self.dyn_proj(y)        # [B, N, k]
+        dyn = dyn.softmax(dim=-1)     # [B, N, k]
 
-        # 2. x (BT, L, C) → [B, T, L, C]로 reshape
-        x_ = x.view(B, T, L, C)
+        # 2. Weighted sum of expert weights to get [B, N, C, C]
+        q_dyn = torch.einsum('bnk,kcd->bncd', dyn, self.q_experts)  # [B, N, C, C]
+        k_dyn = torch.einsum('bnk,kcd->bncd', dyn, self.k_experts)  # [B, N, C, C]
 
+        # 3. Apply projection to input
+        x_reshape = x.view(B, T, N, C)  # [B, T, N, C]
+        q_input = torch.einsum('btnd,bncd->btnd', x_reshape, q_dyn)
+        k_input = torch.einsum('btnd,bncd->btnd', x_reshape, k_dyn)
+        v_input = self.v_proj(x_reshape)  # [B, T, N, C]
 
-        q_proj = torch.einsum('btlc, blcd -> btld', x_, dyn_kernel[:, :, 0])  # Q
-        k_proj = torch.einsum('btlc, blcd -> btld', x_, dyn_kernel[:, :, 1])  # K
-        v_proj = torch.einsum('btlc, blcd -> btld', x_, dyn_kernel[:, :, 2])  # V
+        # 4. Flatten for MultiheadAttention
+        q = q_input.view(BT, N, C)
+        k = k_input.view(BT, N, C)
+        v = v_input.view(BT, N, C)
 
-        q = q_proj.reshape(BT, L, C)
-        k = k_proj.reshape(BT, L, C)
-        v = v_proj.reshape(BT, L, C)
-
-        # 5. Attention
-        attn_out, attn = self.att(q, k, v, key_padding_mask=~(mask.bool()) if mask is not None else None)
+        attn_out, attn = self.att(q, k, v, key_padding_mask=~mask.bool() if mask is not None else None)
         out = self.norm(x + self.dropout(attn_out))
         return out, attn
 
