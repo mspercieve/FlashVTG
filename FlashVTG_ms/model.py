@@ -11,7 +11,7 @@ from FlashVTG_ms.position_encoding import build_position_encoding, PositionEmbed
 import math
 from nncore.nn import build_model as build_adapter
 from blocks.generator import PointGenerator
-from LGI import Phrase_Generate, T_SA, Phrase_Context, PhraseContext_NAT, LowRankDynamicProjector, EntropyGating, Saliency_proj
+from LGI import Phrase_Generate, Phrase_Context, Saliency_proj
 from einops import rearrange
 
 def init_weights(module):
@@ -144,11 +144,7 @@ class FlashVTG_ms(nn.Module):
 
         # build phrase embedding
         self.phrase_generate = Phrase_Generate(args.num_phrase, hidden_dim, args.nheads, args.dropout, args.phrase_layers)
-        #self.phrase_context = Phrase_Context(hidden_dim, args.context_layers, args.nheads, args.dropout, args.num_phrase, args.rank, t_kernels=(1,3,5))
-        self.phrase_context = PhraseContext_NAT(hidden_dim, args.context_layers, args.nheads, args.dropout, args.num_phrase, args.rank, t_kernels=(3,5,7))
-        self.context_proj = LowRankDynamicProjector(hidden_dim, r=args.rank)
-        self.gate = EntropyGating()
-        self.t_sa = T_SA(hidden_dim, args.nheads, args.dropout, num_layers=args.t_sa)
+        self.phrase_context = Phrase_Context(hidden_dim, args.context_layers, args.nheads, args.dropout, args.num_phrase, args.rank, t_kernels=(1,3,5))
         self.saliency_proj = Saliency_proj(hidden_dim)
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, targets=None):
@@ -180,7 +176,6 @@ class FlashVTG_ms(nn.Module):
         # Phrase Generate
         phrase_emb, phrase_att = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
         context_agg = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, T, C]
-        #context_agg = self.context_proj(phrase_emb, context_emb)
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -201,8 +196,7 @@ class FlashVTG_ms(nn.Module):
         # global text update
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
         src_emb = context_agg + vid_emb
-        #src_emb = src_emb + pos_vid
-        #src_emb = self.t_sa(src_emb, src_vid_mask)
+
         
         saliency_scores = self.saliency_proj(src_emb.clone())
         video_msk = (~video_msk).int()
@@ -303,7 +297,6 @@ class FlashVTG_ms(nn.Module):
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
 
                 context_agg_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
-                #context_agg_neg = self.context_proj(phrase_emb_neg, context_emb_neg)
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
@@ -321,9 +314,7 @@ class FlashVTG_ms(nn.Module):
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 
                 vid_mem_neg = context_agg_neg + memory_neg
-                #vid_mem_neg = vid_mem_neg + pos_vid_neg
-                #vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
-                
+
                 saliency_scores_neg = self.saliency_proj(vid_mem_neg.clone())
                 output["saliency_scores_neg"] = saliency_scores_neg
                 output["src_txt_mask_neg"] = src_txt_mask_dummy_neg

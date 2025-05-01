@@ -10,13 +10,13 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 
-from FlashVTG.config import TestOptions
-from FlashVTG.start_end_dataset import (
+from FlashVTG_ms.config import TestOptions
+from FlashVTG_ms.start_end_dataset import (
     StartEndDataset,
     start_end_collate,
     prepare_batch_inputs,
 )
-from FlashVTG.postprocessing import PostProcessorDETR
+from FlashVTG_ms.postprocessing import PostProcessorDETR
 from standalone_eval.eval import eval_submission
 from utils.basic_utils import save_jsonl, save_json
 
