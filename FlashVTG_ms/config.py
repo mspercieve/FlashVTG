@@ -147,6 +147,8 @@ class BaseOptions(object):
                             help="l1: (center-x, width) regression. ce: (st_idx, ed_idx) classification.")
         parser.add_argument("--lw_phrase", type=float, default=1,
                             help="weight for phrase loss, set to 0 will ignore")
+        parser.add_argument('--lw_eos', type=float, default=1.0,
+                            help="weight for eos loss, set to 0 will ignore")
         parser.add_argument("--lw_reg", type=float, default=0.2,
                             help="weight for span loss, set to 0 will ignore")
         parser.add_argument("--lw_cls", type=float, default=1.,

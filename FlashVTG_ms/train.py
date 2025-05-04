@@ -117,7 +117,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
     C_layer = opt.context_layers
     rank = opt.rank
 
-    contribution = "DynamicConvV2"
+    contribution = "T_kernel_channels"
 
     run_name = f"{contribution}_Nphrase{N_phrase}_Nlayer{N_layer}_Clayer{C_layer}_rank{rank}"
 

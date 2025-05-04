@@ -394,9 +394,10 @@ class SetCriterion(nn.Module):
 
 
 
-    def loss_phrase(self, outputs, targets, r=0.3, log=True):
+    def loss_phrase_sqan(self, outputs, targets, r=0.3, log=True):
         self.r = r
         attw = outputs["sqan_att"] # [B,num_att,N]
+        
         NA = attw.size(1)
 
         attw_T = torch.transpose(attw, 1, 2).contiguous()
@@ -404,8 +405,26 @@ class SetCriterion(nn.Module):
         I = torch.eye(NA).unsqueeze(0).type_as(attw) * self.r
         P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
         da_loss = (P**2).mean()
+        return {"loss_phrase_sqan": da_loss}
 
-        return {"loss_phrase": da_loss}
+    def loss_phrase_slot(self, outputs, targets, r=0.3, log=True):
+        self.r = r
+        attw = outputs["slot_att"]
+
+        NA = attw.size(1)
+        attw_T = torch.transpose(attw, 1, 2).contiguous()
+        I = torch.eye(NA).unsqueeze(0).type_as(attw) * self.r
+        P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
+        da_loss = (P**2).mean()
+        return {"loss_phrase_slot": da_loss}
+
+    def loss_eos(self, outputs, targets, margin=0.7, log=True):
+        eos_slot = F.normalize(outputs["eos_slot"], dim=-1)
+        eos_emb = F.normalize(outputs["eos_emb"], dim=-1)
+        # margin cosine similarity
+        cos_sim = torch.sum(eos_slot * eos_emb, dim=-1)
+        loss = F.relu(margin - cos_sim).mean()
+        return {"loss_eos": loss}
 
     def loss_labels(self, outputs, targets, log=True):
         sal_score = targets["saliency_all_labels"]
@@ -571,7 +590,9 @@ class SetCriterion(nn.Module):
             "labels": self.loss_labels,
             "saliency": self.loss_saliency,
             "sal": self.loss_sal,
-            "phrase": self.loss_phrase,
+            "phrase_sqan": self.loss_phrase_sqan,
+            "phrase_slot": self.loss_phrase_slot,
+            "eos": self.loss_eos,
             "cls": self.loss_cls,
             "reg": self.loss_reg,
             "qfl": self.loss_qfl,

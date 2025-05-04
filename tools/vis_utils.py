@@ -232,3 +232,43 @@ def visualize_similarity_matrix(tokens, t_sim, t_proj_sim, qd_t_proj_sim, query_
     else:
         plt.show()
 
+def visualize_phrase_clusters(query, tokens, sqan_attn, slot_attn, save_path=None):
+    """
+    query: str - input text query
+    tokens: list of str - tokenized words from the query (length L)
+    sqan_attn: np.ndarray [N, L] - SQAN attention scores
+    slot_attn: np.ndarray [N, L] - Slot attention scores (after phrase refinement)
+    save_path: str or None - if set, save the figure
+    """
+    N, L = sqan_attn.shape
+    fig, axes = plt.subplots(2, 1, figsize=(min(20, L), 3 + N * 0.7 * 2), constrained_layout=True)
+
+    titles = ['SQAN Attention (Initial Clustering)', 'Slot Attention (After Refinement)']
+    attn_matrices = [sqan_attn, slot_attn]
+
+    for ax, attn, title in zip(axes, attn_matrices, titles):
+        table_data = []
+        for n in range(N):
+            row = [f"{attn[n, l]:.2f}" for l in range(L)]
+            table_data.append(row)
+
+        col_labels = [f"{i}:{tok}" for i, tok in enumerate(tokens)]
+        row_labels = [f"Phrase {n+1}" for n in range(N)]
+
+        ax.axis("off")
+        table = ax.table(cellText=table_data,
+                         rowLabels=row_labels,
+                         colLabels=col_labels,
+                         loc='center',
+                         cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        ax.set_title(title, fontsize=12, pad=10)
+
+    fig.suptitle(f"Query: {query}", fontsize=14, y=1.02)
+
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+        print(f"Saved attention visualization to: {save_path}")
+    else:
+        plt.show()
