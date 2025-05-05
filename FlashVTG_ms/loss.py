@@ -418,14 +418,6 @@ class SetCriterion(nn.Module):
         da_loss = (P**2).mean()
         return {"loss_phrase_slot": da_loss}
 
-    def loss_eos(self, outputs, targets, margin=0.7, log=True):
-        eos_slot = F.normalize(outputs["eos_slot"], dim=-1)
-        eos_emb = F.normalize(outputs["eos_emb"], dim=-1)
-        # margin cosine similarity
-        cos_sim = torch.sum(eos_slot * eos_emb, dim=-1)
-        loss = F.relu(margin - cos_sim).mean()
-        return {"loss_eos": loss}
-
     def loss_labels(self, outputs, targets, log=True):
         sal_score = targets["saliency_all_labels"]
         conf = outputs["out_class"][:, :sal_score.shape[1], 0]
@@ -592,7 +584,6 @@ class SetCriterion(nn.Module):
             "sal": self.loss_sal,
             "phrase_sqan": self.loss_phrase_sqan,
             "phrase_slot": self.loss_phrase_slot,
-            "eos": self.loss_eos,
             "cls": self.loss_cls,
             "reg": self.loss_reg,
             "qfl": self.loss_qfl,

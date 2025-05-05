@@ -131,7 +131,6 @@ class Phrase_Generate(nn.Module):
         self.phrase_att = nn.ModuleList([SlotAttention(num_phrase, hdim, num_heads, drop_p) for _ in range(num_layers)])
         self.sqan = SequentialQueryAttention(num_phrase, hdim)
         self.pos = PositionEmbeddingSine(hdim)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, hdim)) # [1, 1, C]
     def forward(self, txt_emb, txt_mask):
         B, L, C = txt_emb.shape
         stc_emb, word_emb = torch.split(txt_emb, [1, L-1], dim=1)
@@ -141,12 +140,11 @@ class Phrase_Generate(nn.Module):
         word_pos = self.pos(word_emb, word_mask)
         word_pe = word_emb + word_pos
 
-        cls_token = self.cls_token.expand(B, 1, C).contiguous()  # [B 1 C]
-
+        slot_sim = None
         for i in range(self.num_layers):
-            phrase_slot, slot_sim, cls_token = self.phrase_att[i](word_pe, word_mask, phrase_slot, cls_token)
+            phrase_slot, slot_sim = self.phrase_att[i](word_pe, word_mask, phrase_slot)
 
-        return phrase_slot, phrase_attn, slot_sim, cls_token.squeeze(1)  # [B, C]
+        return phrase_slot, phrase_attn, slot_sim  # [B, C]
 
 class SlotAttention(nn.Module):
     def __init__(self, num_phrase, hdim, num_heads, drop_p=0.1):
@@ -170,7 +168,7 @@ class SlotAttention(nn.Module):
         self.dropout1 = nn.Dropout(drop_p)
         self.act = nn.ReLU()
 
-    def forward(self, txt_feat, txt_mask, phrase_slot, cls_token):
+    def forward(self, txt_feat, txt_mask, phrase_slot):
         """
         Inputs:
             txt_feat: [B, L, C]
@@ -192,21 +190,18 @@ class SlotAttention(nn.Module):
         slot_update = self.dropout(slot_update)
         phrase_slot = self.norm(slot_update + phrase_slot)
         # Prevent Phrase Slot from attending to CLS token
+        x = phrase_slot
 
-        x = torch.cat([cls_token, phrase_slot], dim=1)  # [B, N+1, C]
-        mask_x = torch.zeros((N+1,N+1), dtype=bool).to(txt_mask.device)
-        mask_x[1:,0] = True
-        self_update, _ = self.self_att(x, x, x, attn_mask=mask_x)
+        self_update, _ = self.self_att(x, x, x)
         self_update = self.dropout_s(self_update)
         x = self.norm_s(x + self_update)
 
         x = x + self.dropout1(self.act(self.linear1(x)))
         x = self.norm1(x)
 
-        cls_out = x[:, :1]        # [B, C]
-        phrase_slot = x[:, 1:]   # [B, N, C]
+        phrase_slot = x
 
-        return phrase_slot, slot_sim, cls_out
+        return phrase_slot, slot_sim
     
 class LowRankDynamicConv(nn.Module):
     def __init__(self, hdim, num_phrase, rank=32, t_kernels=(1, 3, 5)):
@@ -218,7 +213,7 @@ class LowRankDynamicConv(nn.Module):
 
         # projection from phrase_emb to low-rank factors
 
-        self.phrase_proj = nn.Linear(2 * hdim, hdim * rank)
+        self.phrase_proj = nn.Linear( hdim, hdim * rank)
 
         # for each kernel we now keep a separate output dimension
         # out_dims[i] = hdim // (2**i)
@@ -249,14 +244,12 @@ class LowRankDynamicConv(nn.Module):
             stride=(stride[0], stride[1], stride[1], stride[2], stride[3])
         )
 
-    def forward(self, context_emb, phrase_slot, eos_slot):
+    def forward(self, context_emb, phrase_slot):
         B, T, N, C = context_emb.shape
         outputs = []
-        eos_slot = eos_slot.unsqueeze(1).expand(-1, N, -1)  # [B, 1, C] → [B, N, C]
-        # 1) phrase → low-rank factors: [B, N, C*r]
-        phrase_slot = torch.cat([phrase_slot, eos_slot], dim=-1)  # [B, N, 2*C]
+        #phrase_slot = rearrange(phrase_slot, 'b n c -> b (n c)')  # [B, N*C]
         phrase_proj = self.phrase_proj(phrase_slot)
-        phrase_proj = rearrange(phrase_proj, 'b n (c r) -> b n c r', c=C, r=self.rank)
+        phrase_proj = rearrange(phrase_proj, 'b n (c r) -> b n c r',  c=C, r=self.rank)
 
         for i, k in enumerate(self.t_kernels):
             out_dim = self.out_dims[i]
@@ -342,7 +335,7 @@ class Phrase_Context(nn.Module):
         self.pos = PositionEmbeddingSine(hdim)
         self.local_context = LowRankDynamicConv(hdim, num_phrase, rank, t_kernels)
 
-    def forward(self, phrase_slot, eos_slot, vid_feat, vid_mask):
+    def forward(self, phrase_slot, vid_feat, vid_mask):
         """
         Args:
             phrase_slot: [B, N, C] phrase slots
@@ -363,7 +356,7 @@ class Phrase_Context(nn.Module):
         for layer in self.layers:
             context_emb = layer(context_emb, phrase_slot, vid_mask, (B, N, T, C))
         context_emb = rearrange(context_emb, '(b n) t c -> b t n c', b=B, n=N)
-        context_agg = self.local_context(context_emb, phrase_slot, eos_slot)
+        context_agg = self.local_context(context_emb, phrase_slot)
         return context_agg
 
 class HadamardProduct(nn.Module):

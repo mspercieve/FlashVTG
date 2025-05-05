@@ -147,7 +147,7 @@ model, criterion = build_model1(opt)
 model = model.to(device)
 model.eval()
 
-model_path = "results/hl-video_tef-exp-2025-04-29-21-21-54/model_best.ckpt"
+model_path = "results/hl-video_tef-exp-2025-05-04-12-05-21/model_best.ckpt"
 state_dict = torch.load(model_path, map_location="cpu")["model"]
 for name, param in model.named_parameters():
     if name in state_dict:

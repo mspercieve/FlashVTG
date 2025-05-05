@@ -175,8 +175,8 @@ class FlashVTG_ms(nn.Module):
         pos_glob, pos_word = torch.split(pos_txt, [1, pos_txt.size(1)-1], dim=1)
 
         # Phrase Generate
-        phrase_emb, phrase_att, slot_sim, eos_slot = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
-        context_agg = self.phrase_context(phrase_emb, eos_slot, src_vid, src_vid_mask) # [B, T, C]
+        phrase_emb, phrase_att, slot_sim = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
+        context_agg = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, T, C]
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -232,8 +232,7 @@ class FlashVTG_ms(nn.Module):
             output["t2vattnvalues"] = torch.clamp(output["t2vattnvalues"], 0, 1)
             output["sqan_att"] = phrase_att
             output["slot_att"] = slot_sim
-            output["eos_slot"] = eos_slot
-            output["eos_emb"] = src_glob
+
             if self.training == True:
                 output["sim_score"] = sim_score
                 output["point"] = point
@@ -299,13 +298,10 @@ class FlashVTG_ms(nn.Module):
             if real_neg_mask.any():
                 # phrase neg
                 phrase_emb_neg = torch.cat([phrase_emb[1:], phrase_emb[0:1]], dim=0)
-                eos_slot_neg = torch.cat([eos_slot[1:], eos_slot[0:1]], dim=0)
-
                 src_vid_neg = src_vid[real_neg_mask]
                 vid_mask_neg = src_vid_mask[real_neg_mask]
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
-                eos_slot_neg = eos_slot_neg[real_neg_mask]
-                context_agg_neg = self.phrase_context(phrase_emb_neg, eos_slot_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
+                context_agg_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
@@ -429,12 +425,11 @@ def build_model1(args):
                    "loss_cls": args.lw_cls,
                    "loss_sal": args.lw_sal,
                    "loss_phrase_sqan": args.lw_phrase,
-                   "loss_phrase_slot": args.lw_phrase,
-                   "loss_eos": args.lw_eos,
+                   #"loss_phrase_slot": args.lw_phrase,
                    "loss_qfl": 0,
                    }
 
-    losses = ["saliency", 'labels', 'phrase_sqan', 'phrase_slot', 'eos', 'sal', 'reg', 'cls', 'qfl']
+    losses = ["saliency", 'labels', 'phrase_sqan', 'sal', 'reg', 'cls', 'qfl']
     #losses = ["labels", "phrase"]
     from FlashVTG_ms.loss import SetCriterion
     criterion = SetCriterion(
