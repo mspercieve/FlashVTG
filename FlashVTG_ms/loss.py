@@ -401,13 +401,13 @@ class SetCriterion(nn.Module):
         NA = attw.size(1)
 
         attw_T = torch.transpose(attw, 1, 2).contiguous()
-
+    
         I = torch.eye(NA).unsqueeze(0).type_as(attw) * self.r
         P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
         da_loss = (P**2).mean()
         return {"loss_phrase_sqan": da_loss}
 
-    def loss_phrase_slot(self, outputs, targets, r=0.3, log=True):
+    def loss_phrase_slot(self, outputs, targets, r=0.5, log=True):
         self.r = r
         attw = outputs["slot_att"]
 
@@ -417,6 +417,26 @@ class SetCriterion(nn.Module):
         P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
         da_loss = (P**2).mean()
         return {"loss_phrase_slot": da_loss}
+
+    def loss_eos(self, outputs, targets, log=True):
+        eos_slot = outputs["eos_slot"]  # [B, 1, C]
+        eos_emb = outputs["eos_emb"]    # [B, 1, C]
+        
+        # 정규화
+        eos_slot = F.normalize(eos_slot.squeeze(1), dim=-1)  # [B, C]
+        eos_emb = F.normalize(eos_emb.squeeze(1), dim=-1)    # [B, C]
+        
+        # 유사도 행렬 계산 [B, B]
+        temperature = 0.1
+        logits = torch.matmul(eos_slot, eos_emb.T) / temperature
+        
+        # 각 샘플의 positive pair는 자기 자신
+        labels = torch.arange(logits.size(0), device=logits.device)
+        
+        # InfoNCE loss
+        loss = F.cross_entropy(logits, labels)
+        
+        return {"loss_eos": loss}
 
     def loss_labels(self, outputs, targets, log=True):
         sal_score = targets["saliency_all_labels"]
@@ -584,6 +604,7 @@ class SetCriterion(nn.Module):
             "sal": self.loss_sal,
             "phrase_sqan": self.loss_phrase_sqan,
             "phrase_slot": self.loss_phrase_slot,
+            "eos": self.loss_eos,
             "cls": self.loss_cls,
             "reg": self.loss_reg,
             "qfl": self.loss_qfl,

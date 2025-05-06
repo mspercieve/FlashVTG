@@ -175,8 +175,8 @@ class FlashVTG_ms(nn.Module):
         pos_glob, pos_word = torch.split(pos_txt, [1, pos_txt.size(1)-1], dim=1)
 
         # Phrase Generate
-        phrase_emb, phrase_att, slot_sim = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
-        context_agg = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, T, C]
+        phrase_emb, phrase_att, slot_sim, eos_slot = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
+        context_agg, context_emb_out = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, T, C]
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -196,8 +196,8 @@ class FlashVTG_ms(nn.Module):
 
         # global text update
         vid_emb, video_msk, pos_embed, attn_weights = self.transformer(src, ~mask, pos, video_length=video_length)
-        src_emb = context_agg + vid_emb
-
+        #src_emb = context_agg + vid_emb
+        src_emb = context_agg
         # t consistency
         src_emb = src_emb + pos_vid
         src_emb = self.t_sa(src_emb, src_vid_mask)
@@ -232,7 +232,11 @@ class FlashVTG_ms(nn.Module):
             output["t2vattnvalues"] = torch.clamp(output["t2vattnvalues"], 0, 1)
             output["sqan_att"] = phrase_att
             output["slot_att"] = slot_sim
-
+            output["eos_slot"] = eos_slot
+            output["eos_emb"] = src_glob
+            output["context_agg"] = context_agg
+            output["context_emb_out"] = context_emb_out
+            output["vid_emb"] = vid_emb
             if self.training == True:
                 output["sim_score"] = sim_score
                 output["point"] = point
@@ -301,7 +305,7 @@ class FlashVTG_ms(nn.Module):
                 src_vid_neg = src_vid[real_neg_mask]
                 vid_mask_neg = src_vid_mask[real_neg_mask]
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
-                context_agg_neg = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
+                context_agg_neg, _ = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg) # [B, N, T, C]
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
@@ -318,7 +322,8 @@ class FlashVTG_ms(nn.Module):
                 
                 memory_neg, video_msk, pos_embed, attn_weights_neg= self.transformer(src_dummy_neg, ~mask_dummy_neg, pos_neg, video_length=video_length)
                 
-                vid_mem_neg = context_agg_neg + memory_neg
+                #vid_mem_neg = context_agg_neg + memory_neg
+                vid_mem_neg = context_agg_neg
                 vid_mem_neg = vid_mem_neg + pos_vid_neg
                 vid_mem_neg = self.t_sa(vid_mem_neg, vid_mask_neg)
 
@@ -424,12 +429,13 @@ def build_model1(args):
                    'loss_reg': args.lw_reg,
                    "loss_cls": args.lw_cls,
                    "loss_sal": args.lw_sal,
+                   "loss_eos": args.lw_eos,
                    "loss_phrase_sqan": args.lw_phrase,
                    #"loss_phrase_slot": args.lw_phrase,
                    "loss_qfl": 0,
                    }
 
-    losses = ["saliency", 'labels', 'phrase_sqan', 'sal', 'reg', 'cls', 'qfl']
+    losses = ["saliency", 'labels', 'phrase_sqan', 'eos', 'sal', 'reg', 'cls', 'qfl']
     #losses = ["labels", "phrase"]
     from FlashVTG_ms.loss import SetCriterion
     criterion = SetCriterion(

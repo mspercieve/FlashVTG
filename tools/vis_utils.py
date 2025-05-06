@@ -232,43 +232,131 @@ def visualize_similarity_matrix(tokens, t_sim, t_proj_sim, qd_t_proj_sim, query_
     else:
         plt.show()
 
-def visualize_phrase_clusters(query, tokens, sqan_attn, slot_attn, save_path=None):
+def visualize_phrase_and_context(query, tokens, sqan_attn, context_emb, context_agg, vid_emb, moment_gt=None, pred_boundary=None, save_path=None):
     """
     query: str - input text query
     tokens: list of str - tokenized words from the query (length L)
     sqan_attn: np.ndarray [N, L] - SQAN attention scores
-    slot_attn: np.ndarray [N, L] - Slot attention scores (after phrase refinement)
+    context_emb: np.ndarray [N, T, C] - context embedding scores
+    context_agg: np.ndarray [N, T, C] - context aggregated scores
+    vid_emb: np.ndarray [T, C] - video embedding
+    moment_gt: list of tuples - ground truth moments [(start1, end1), (start2, end2), ...]
+    pred_boundary: np.ndarray - model predictions [N, 3] (start, end, score)
     save_path: str or None - if set, save the figure
     """
     N, L = sqan_attn.shape
-    fig, axes = plt.subplots(2, 1, figsize=(min(20, L), 3 + N * 0.7 * 2), constrained_layout=True)
-
-    titles = ['SQAN Attention (Initial Clustering)', 'Slot Attention (After Refinement)']
-    attn_matrices = [sqan_attn, slot_attn]
-
-    for ax, attn, title in zip(axes, attn_matrices, titles):
-        table_data = []
-        for n in range(N):
-            row = [f"{attn[n, l]:.2f}" for l in range(L)]
-            table_data.append(row)
-
-        col_labels = [f"{i}:{tok}" for i, tok in enumerate(tokens)]
-        row_labels = [f"Phrase {n+1}" for n in range(N)]
-
-        ax.axis("off")
-        table = ax.table(cellText=table_data,
-                         rowLabels=row_labels,
-                         colLabels=col_labels,
-                         loc='center',
-                         cellLoc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        ax.set_title(title, fontsize=12, pad=10)
-
+    N, T, C = context_emb.shape
+    
+    # Context activation과 Video embedding의 L2 norm 계산
+    context_norm = np.linalg.norm(context_emb, axis=-1)  # [N, T]
+    context_agg_norm = np.linalg.norm(context_agg, axis=-1)  # [T]
+    vid_norm = np.linalg.norm(vid_emb, axis=-1)  # [T]
+    
+    # context_agg_norm과 vid_norm을 2차원으로 변환 (1, T)
+    context_agg_norm = context_agg_norm[np.newaxis, :]  # [1, T]로 변환
+    vid_norm = vid_norm[np.newaxis, :]  # [1, T]로 변환
+    
+    # 4개의 subplot 생성
+    fig = plt.figure(figsize=(20, 15))
+    gs = fig.add_gridspec(4, 1, height_ratios=[1, 1, 1, 1])
+    
+    # 1. Phrase Attention 히트맵
+    ax1 = fig.add_subplot(gs[0])
+    im1 = ax1.imshow(sqan_attn, aspect='auto', cmap='Greys')
+    ax1.set_yticks(np.arange(N))
+    ax1.set_yticklabels([f"Phrase {n+1}" for n in range(N)])
+    ax1.set_xticks(np.arange(L))
+    clean_tokens = [tok.replace('_', '') for tok in tokens]
+    ax1.set_xticklabels([f"{i}:{tok}" for i, tok in enumerate(clean_tokens)], 
+                        rotation=45, ha='right', position=(0, 1.1))
+    cbar1 = plt.colorbar(im1, ax=ax1)
+    cbar1.set_label('Attention Score')
+    ax1.set_title("Phrase-Word Attention", fontsize=12, pad=10)
+    
+    # x축 tick 설정 수정
+    tick_positions = np.linspace(0, T-1, 10, dtype=int)
+    tick_labels = [str(pos) for pos in tick_positions]
+    
+    # 2. Context activation L2 norm 히트맵
+    ax2 = fig.add_subplot(gs[1])
+    im2 = ax2.imshow(context_norm, aspect='auto', cmap='YlOrRd')
+    ax2.set_yticks(np.arange(N))
+    ax2.set_yticklabels([f"Phrase {n+1}" for n in range(N)])
+    ax2.set_xticks(tick_positions)
+    ax2.set_xticklabels(tick_labels)
+    cbar2 = plt.colorbar(im2, ax=ax2)
+    cbar2.set_label('L2 Norm')
+    ax2.set_title("Context Activation (L2 Norm)", fontsize=12, pad=10)
+    
+    # 3. Context Aggregation L2 norm 히트맵
+    ax3 = fig.add_subplot(gs[2])
+    im3 = ax3.imshow(context_agg_norm, aspect='auto', cmap='YlOrRd')
+    ax3.set_yticks([])  # y축 레이블 제거
+    ax3.set_xticks(tick_positions)
+    ax3.set_xticklabels(tick_labels)
+    cbar3 = plt.colorbar(im3, ax=ax3)
+    cbar3.set_label('L2 Norm')
+    ax3.set_title("Context Aggregation (L2 Norm)", fontsize=12, pad=10)
+    
+    # 4. Video embedding L2 norm 히트맵
+    ax4 = fig.add_subplot(gs[3])
+    im4 = ax4.imshow(vid_norm, aspect='auto', cmap='YlOrRd')
+    ax4.set_yticks([])  # y축 레이블 제거
+    ax4.set_xticks(tick_positions)
+    ax4.set_xticklabels(tick_labels)
+    cbar4 = plt.colorbar(im4, ax=ax4)
+    cbar4.set_label('L2 Norm')
+    ax4.set_title("Video Embedding Activation (L2 Norm)", fontsize=12, pad=10)
+    
+    # GT moment 구간을 activation map에 표시
+    if moment_gt is not None:
+        for start, end in moment_gt:
+            # Context activation 히트맵에 박스 추가
+            rect2 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
+                                fill=False, edgecolor='black', linewidth=3)
+            ax2.add_patch(rect2)
+            
+            # Context aggregation 히트맵에 박스 추가
+            rect3 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
+                                fill=False, edgecolor='black', linewidth=3)
+            ax3.add_patch(rect3)
+            
+            # Video embedding 히트맵에 박스 추가
+            rect4 = plt.Rectangle((start-0.5, -0.5), end-start+1, 1, 
+                                fill=False, edgecolor='black', linewidth=3)
+            ax4.add_patch(rect4)
+    
+    # 모델 예측 구간을 activation map에 표시
+    if pred_boundary is not None:
+        num_preds = len(moment_gt) if moment_gt is not None else 1  # GT 개수만큼만 표시
+        for i in range(num_preds):
+            start, end = int(pred_boundary[i][0]), int(pred_boundary[i][1])
+            # Context activation 히트맵에 점선 추가
+            rect2 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
+                                fill=False, edgecolor='blue', linewidth=2, linestyle='--')
+            ax2.add_patch(rect2)
+            
+            # Context aggregation 히트맵에 점선 추가
+            rect3 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
+                                fill=False, edgecolor='blue', linewidth=2, linestyle='--')
+            ax3.add_patch(rect3)
+            
+            # Video embedding 히트맵에 점선 추가
+            rect4 = plt.Rectangle((start-0.5, -0.5), end-start+1, 1, 
+                                fill=False, edgecolor='blue', linewidth=2, linestyle='--')
+            ax4.add_patch(rect4)
+    
+    # 전체 제목 설정
     fig.suptitle(f"Query: {query}", fontsize=14, y=1.02)
-
+    
+    # 토큰 정보를 표시하는 텍스트 박스 추가
+    token_text = "Tokens: " + " ".join([f"{i}:{tok}" for i, tok in enumerate(clean_tokens)])
+    plt.figtext(0.5, 0.01, token_text, ha='center', fontsize=10, 
+                bbox=dict(facecolor='white', alpha=0.8))
+    
     if save_path:
         plt.savefig(save_path, bbox_inches='tight')
-        print(f"Saved attention visualization to: {save_path}")
+        print(f"Saved visualization to: {save_path}")
     else:
         plt.show()
+    plt.close()

@@ -8,7 +8,7 @@ import math
 from .position_encoding import PositionEmbeddingSine
 from einops import rearrange, repeat
 from natten.functional import natten2dqkrpb, natten2dav
-
+from .transformer import TransformerEncoderLayer, TransformerEncoder
 
 class Attention(nn.Module):
     def __init__(self, kdim, cdim, hdim, drop_p):
@@ -131,6 +131,19 @@ class Phrase_Generate(nn.Module):
         self.phrase_att = nn.ModuleList([SlotAttention(num_phrase, hdim, num_heads, drop_p) for _ in range(num_layers)])
         self.sqan = SequentialQueryAttention(num_phrase, hdim)
         self.pos = PositionEmbeddingSine(hdim)
+        self.eos_slot = nn.Parameter(torch.randn(1, 1, hdim)) # [1, 1, C]
+        
+        # Transformer Encoder for EOS slot encoding
+        encoder_layer = TransformerEncoderLayer(
+            d_model=hdim,
+            nhead=num_heads,
+            dim_feedforward=hdim*4,
+            dropout=drop_p,
+            activation="relu",
+            normalize_before=False
+        )
+        self.eos_encoder = TransformerEncoder(encoder_layer, num_layers=2)
+        
     def forward(self, txt_emb, txt_mask):
         B, L, C = txt_emb.shape
         stc_emb, word_emb = torch.split(txt_emb, [1, L-1], dim=1)
@@ -140,11 +153,21 @@ class Phrase_Generate(nn.Module):
         word_pos = self.pos(word_emb, word_mask)
         word_pe = word_emb + word_pos
 
-        slot_sim = None
+        slot_sim_lst = []
         for i in range(self.num_layers):
             phrase_slot, slot_sim = self.phrase_att[i](word_pe, word_mask, phrase_slot)
+            slot_sim_lst.append(slot_sim)
+        slot_sim = None
+        
+        # EOS slot 생성 - Transformer Encoder 사용
+        eos_slot = self.eos_slot.expand(B, 1, C)  # [B, 1, C]
+        combined_slots = torch.cat([eos_slot, phrase_slot], dim=1)  # [B, N+1, C]
+        combined_slots = combined_slots.permute(1, 0, 2)  # [N+1, B, C]
+        encoded_slots = self.eos_encoder(combined_slots)  # [N+1, B, C]
+        encoded_slots = encoded_slots.permute(1, 0, 2)  # [B, N+1, C]
+        eos_slot = encoded_slots[:, 0:1]  # [B, 1, C]
 
-        return phrase_slot, phrase_attn, slot_sim  # [B, C]
+        return phrase_slot, phrase_attn, slot_sim, eos_slot
 
 class SlotAttention(nn.Module):
     def __init__(self, num_phrase, hdim, num_heads, drop_p=0.1):
@@ -161,7 +184,6 @@ class SlotAttention(nn.Module):
         self.k_proj = nn.Linear(hdim, hdim)
         self.v_proj = nn.Linear(hdim, hdim)
         self.slot_att = nn.MultiheadAttention(hdim, self.nh, batch_first=True, dropout=drop_p)
-        self.self_att = nn.MultiheadAttention(hdim, self.nh, batch_first=True, dropout=drop_p)
 
         self.linear1 = nn.Linear(hdim, hdim)
         self.norm1 = nn.LayerNorm(hdim)
@@ -192,10 +214,6 @@ class SlotAttention(nn.Module):
         # Prevent Phrase Slot from attending to CLS token
         x = phrase_slot
 
-        self_update, _ = self.self_att(x, x, x)
-        self_update = self.dropout_s(self_update)
-        x = self.norm_s(x + self_update)
-
         x = x + self.dropout1(self.act(self.linear1(x)))
         x = self.norm1(x)
 
@@ -213,7 +231,7 @@ class LowRankDynamicConv(nn.Module):
 
         # projection from phrase_emb to low-rank factors
 
-        self.phrase_proj = nn.Linear( hdim, hdim * rank)
+        self.phrase_proj = nn.Linear(hdim, hdim * rank)
 
         # for each kernel we now keep a separate output dimension
         # out_dims[i] = hdim // (2**i)
@@ -347,17 +365,19 @@ class Phrase_Context(nn.Module):
         N = phrase_slot.shape[1]
         
         context_emb = self.product([phrase_slot, vid_feat]) # [ B, N, T, C]
+        context_emb_out = context_emb
         context_emb = rearrange(context_emb, 'b n t c -> (b n) t c') # [B*N, T, C]
         
         vid_mask = repeat(vid_mask, 'b t -> (b n) t', n=N) # [B*N, T]
         pos = self.pos(context_emb, vid_mask) # [B*N, T, C]
         context_emb = context_emb + pos
-
+        
         for layer in self.layers:
             context_emb = layer(context_emb, phrase_slot, vid_mask, (B, N, T, C))
         context_emb = rearrange(context_emb, '(b n) t c -> b t n c', b=B, n=N)
+        #context_emb_out = context_emb.permute(0, 2, 1, 3) # [B, N, T, C]
         context_agg = self.local_context(context_emb, phrase_slot)
-        return context_agg
+        return context_agg, context_emb_out
 
 class HadamardProduct(nn.Module):
     def __init__(self, idim_1, idim_2, hdim):

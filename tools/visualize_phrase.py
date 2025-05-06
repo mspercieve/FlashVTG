@@ -18,7 +18,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 from PIL import Image
 import glob
-from vis_utils import visualize_phrase_clusters
+from vis_utils import visualize_phrase_and_context
 from FlashVTG_ms.model import build_model1
 
 # tokenizer
@@ -147,7 +147,7 @@ model, criterion = build_model1(opt)
 model = model.to(device)
 model.eval()
 
-model_path = "results/hl-video_tef-exp-2025-05-04-12-05-21/model_best.ckpt"
+model_path = "results/hl-video_tef-exp-2025-05-06-20-16-35/model_best.ckpt"
 state_dict = torch.load(model_path, map_location="cpu")["model"]
 for name, param in model.named_parameters():
     if name in state_dict:
@@ -176,14 +176,42 @@ for i, batch in enumerate(train_loader):
     moment_gt_divided = [[int(x / 2) for x in sublist] for sublist in moment_gt]
     # 모델 출력에서 attention score 가져오기 (Tensor → numpy)
     sqan_attn_np = outputs["sqan_att"][0].detach().cpu().numpy()  # [N, L]
-    slot_attn_np = outputs["slot_att"][0].detach().cpu().numpy()  # [N, L]
-    # attention 시각화
-    visualize_phrase_clusters(
+    context_emb_np = outputs["context_emb_out"][0].detach().cpu().numpy()  # [N, T, C]
+    context_agg_np = outputs["context_agg"][0].detach().cpu().numpy()  # [T, C]
+    vid_emb_np = outputs["vid_emb"][0].detach().cpu().numpy()  # [T, C]
+    
+    # shape 확인을 위한 디버깅 출력
+    print("Shapes:")
+    print(f"sqan_attn_np: {sqan_attn_np.shape}")
+    print(f"context_emb_np: {context_emb_np.shape}")
+    print(f"context_agg_np: {context_agg_np.shape}")
+    print(f"vid_emb_np: {vid_emb_np.shape}")
+    
+    # 값 확인을 위한 디버깅 출력
+    print("\nValues:")
+    print("context_agg_np mean:", np.mean(context_agg_np, axis=-1))
+    print("vid_emb_np mean:", np.mean(vid_emb_np, axis=-1))
+    
+    # context_agg가 1차원이면 2차원으로 변환 (T, C)
+    if len(context_agg_np.shape) == 1:
+        context_agg_np = context_agg_np.reshape(-1, context_emb_np.shape[-1])  # [T, C]로 변환
+    
+    # 모델 예측 구간 가져오기
+    pred_boundary = None
+    if "_out" in outputs and "boundary" in outputs["_out"]:
+        pred_boundary = outputs["_out"]["boundary"].detach().cpu().numpy()  # [N, 3] (start, end, score)
+    
+    # phrase attention과 context activation 시각화
+    visualize_phrase_and_context(
         query=query,
         tokens=token[4:-1],
         sqan_attn=sqan_attn_np,
-        slot_attn=slot_attn_np,
-        save_path=os.path.join(save_path, f"{vid}_phrase.png")
+        context_emb=context_emb_np,
+        context_agg=context_agg_np,
+        vid_emb=vid_emb_np,
+        moment_gt=moment_gt_divided,
+        pred_boundary=pred_boundary,
+        save_path=os.path.join(save_path, f"{vid}_visualization.png")
     )
 
     
