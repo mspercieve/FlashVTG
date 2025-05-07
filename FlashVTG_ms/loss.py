@@ -405,18 +405,34 @@ class SetCriterion(nn.Module):
         I = torch.eye(NA).unsqueeze(0).type_as(attw) * self.r
         P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
         da_loss = (P**2).mean()
-        return {"loss_phrase_sqan": da_loss}
+
+        # Word Coverage Loss
+        word_coverage = attw.sum(dim=1)  # [B, N] - 각 단어가 모든 phrase에 할당된 정도
+        min_coverage = 0.3  # 최소 coverage threshold
+        coverage_loss = F.relu(min_coverage - word_coverage).mean()
+
+        total_loss = da_loss + 0.3 * coverage_loss
+        return {"loss_phrase_sqan": total_loss}
 
     def loss_phrase_slot(self, outputs, targets, r=0.5, log=True):
         self.r = r
-        attw = outputs["slot_att"]
+        attw = outputs["slot_att"]  # [B, N, L]
 
+        # 1. 기존의 orthogonal loss
         NA = attw.size(1)
         attw_T = torch.transpose(attw, 1, 2).contiguous()
         I = torch.eye(NA).unsqueeze(0).type_as(attw) * self.r
         P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
         da_loss = (P**2).mean()
-        return {"loss_phrase_slot": da_loss}
+
+        # 2. Word Coverage Loss
+        # 각 단어가 최소한 하나의 phrase에 할당되도록
+        word_coverage = attw.sum(dim=1)  # [B, L] - 각 단어가 모든 phrase에 할당된 정도
+        min_coverage = 0.2  # 최소 coverage threshold
+        coverage_loss = F.relu(min_coverage - word_coverage).mean()
+
+        total_loss = da_loss + 0.1 * coverage_loss
+        return {"loss_phrase_slot": total_loss}
 
     def loss_eos(self, outputs, targets, log=True):
         eos_slot = outputs["eos_slot"]  # [B, 1, C]

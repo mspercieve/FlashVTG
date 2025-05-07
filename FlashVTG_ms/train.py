@@ -107,7 +107,7 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
     
     return losses, epoch_i * num_training_examples + batch_idx
 
-def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt):
+def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, test_dataset, opt):
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")
         model.to(opt.device)
@@ -142,9 +142,6 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
         start_epoch = -1 if opt.eval_untrained else 0
     else:
         start_epoch = opt.start_epoch
-    save_submission_filename = "latest_{}_{}_preds.jsonl".format(
-        opt.dset_name, opt.eval_split_name
-    )
     
     for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
         if epoch_i > -1:
@@ -155,20 +152,21 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
         eval_epoch_interval = opt.eval_epoch
 
         if opt.eval_path is not None and (epoch_i + 1) % eval_epoch_interval == 0:
+            # Validation
             with torch.no_grad():
                 metrics_no_nms, metrics_nms, eval_loss_meters, latest_file_paths = (
                     eval_epoch(
                         model,
                         val_dataset,
                         opt,
-                        save_submission_filename,
+                        f"val_latest_{opt.dset_name}_preds.jsonl",
                         epoch_i,
                         criterion,
                         tb_writer,
                     )
                 )
 
-            # log
+            # log validation results
             to_write = opt.eval_log_txt_formatter.format(
                 time_str=time.strftime("%Y_%m_%d_%H_%M_%S"),
                 epoch=epoch_i,
@@ -181,66 +179,45 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             with open(opt.eval_log_filepath, "a") as f:
                 f.write(to_write)
             logger.info(
-                "metrics_no_nms {}".format(
+                "Validation metrics_no_nms {}".format(
                     pprint.pformat(metrics_no_nms["brief"], indent=4)
                 )
             )
             if metrics_nms is not None:
                 logger.info(
-                    "metrics_nms {}".format(
+                    "Validation metrics_nms {}".format(
                         pprint.pformat(metrics_nms["brief"], indent=4)
                     )
                 )
                 with open(opt.eval_log_filepath, "a") as f:
-                    f.write("metrics_nms {}\n".format(pprint.pformat(metrics_nms["brief"], indent=4)))
+                    f.write("Validation metrics_nms {}\n".format(pprint.pformat(metrics_nms["brief"], indent=4)))
+
             metrics = metrics_no_nms
             for k, v in metrics["brief"].items():
-                tb_writer.add_scalar(f"Eval/{k}", float(v), iteration)
+                tb_writer.add_scalar(f"Val/{k}", float(v), epoch_i + 1)
 
-            if opt.dset_name in ["hl"]:
-                stop_score = metrics["brief"]["MR-full-mAP"]
-            elif opt.dset_name in ["tacos"]:
-                stop_score = metrics["brief"]["MR-full-R1@0.3"]
-            else:
-                stop_score = (
-                    metrics["brief"]["MR-full-R1@0.7"]
-                    + metrics["brief"]["MR-full-R1@0.5"]
-                ) / 2
-
-            if stop_score > prev_best_score:
+            # Save best model
+            if metrics["brief"]["mAP"] > prev_best_score:
+                prev_best_score = metrics["brief"]["mAP"]
                 es_cnt = 0
-                prev_best_score = stop_score
-
                 checkpoint = {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
                     "epoch": epoch_i,
                     "opt": opt,
                 }
                 torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"))
-
-                best_file_paths = [
-                    e.replace("latest", "best") for e in latest_file_paths
-                ]
-                for src, tgt in zip(latest_file_paths, best_file_paths):
-                    os.renames(src, tgt)
-                logger.info("The checkpoint file has been updated.")
+                logger.info("Saved best model checkpoint to [{}]".format(opt.ckpt_filepath.replace(".ckpt", "_best.ckpt")))
             else:
                 es_cnt += 1
-                if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:  # early stop
-                    with open(opt.train_log_filepath, "a") as f:
-                        f.write(f"Early Stop at epoch {epoch_i}")
-                    logger.info(
-                        f"\n>>>>> Early stop at epoch {epoch_i}  {prev_best_score}\n"
-                    )
+                if es_cnt > opt.max_es_cnt:
+                    logger.info("Early stop at epoch {}".format(epoch_i))
                     break
 
-        # save ckpt
+        # Save latest model
         checkpoint = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "lr_scheduler": lr_scheduler.state_dict(),
             "epoch": epoch_i,
             "opt": opt,
         }
@@ -250,6 +227,51 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             break
 
     tb_writer.close()
+
+    # Final evaluation on validation and test sets
+    logger.info("\n\nEvaluating best model...")
+    checkpoint = torch.load(opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"))
+    model.load_state_dict(checkpoint["model"])
+    
+    # Validation set evaluation
+    with torch.no_grad():
+        metrics_no_nms, metrics_nms, eval_loss_meters, _ = eval_epoch(
+            model, val_dataset, opt, f"val_best_{opt.dset_name}_preds.jsonl", epoch_i, criterion, tb_writer
+        )
+    logger.info("Best model validation metrics_no_nms: {}".format(pprint.pformat(metrics_no_nms["brief"], indent=4)))
+    if metrics_nms is not None:
+        logger.info("Best model validation metrics_nms: {}".format(pprint.pformat(metrics_nms["brief"], indent=4)))
+    
+    # Test set evaluation
+    with torch.no_grad():
+        metrics_no_nms, metrics_nms, eval_loss_meters, _ = eval_epoch(
+            model, test_dataset, opt, f"test_best_{opt.dset_name}_preds.jsonl", epoch_i, criterion, tb_writer
+        )
+    logger.info("Best model test metrics_no_nms: {}".format(pprint.pformat(metrics_no_nms["brief"], indent=4)))
+    if metrics_nms is not None:
+        logger.info("Best model test metrics_nms: {}".format(pprint.pformat(metrics_nms["brief"], indent=4)))
+
+    logger.info("\n\nEvaluating latest model...")
+    checkpoint = torch.load(opt.ckpt_filepath.replace(".ckpt", "_latest.ckpt"))
+    model.load_state_dict(checkpoint["model"])
+    
+    # Validation set evaluation
+    with torch.no_grad():
+        metrics_no_nms, metrics_nms, eval_loss_meters, _ = eval_epoch(
+            model, val_dataset, opt, f"val_latest_{opt.dset_name}_preds.jsonl", epoch_i, criterion, tb_writer
+        )
+    logger.info("Latest model validation metrics_no_nms: {}".format(pprint.pformat(metrics_no_nms["brief"], indent=4)))
+    if metrics_nms is not None:
+        logger.info("Latest model validation metrics_nms: {}".format(pprint.pformat(metrics_nms["brief"], indent=4)))
+    
+    # Test set evaluation
+    with torch.no_grad():
+        metrics_no_nms, metrics_nms, eval_loss_meters, _ = eval_epoch(
+            model, test_dataset, opt, f"test_latest_{opt.dset_name}_preds.jsonl", epoch_i, criterion, tb_writer
+        )
+    logger.info("Latest model test metrics_no_nms: {}".format(pprint.pformat(metrics_no_nms["brief"], indent=4)))
+    if metrics_nms is not None:
+        logger.info("Latest model test metrics_nms: {}".format(pprint.pformat(metrics_nms["brief"], indent=4)))
 
 def train_hl(
     model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt
@@ -380,7 +402,8 @@ def train_hl(
 def start_training():
     logger.info("Setup data and model...")
 
-    dataset_config = dict(
+    # setup data
+    train_dataset = StartEndDataset(
         dset_name=opt.dset_name,
         data_path=opt.train_path,
         v_feat_dirs=opt.v_feat_dirs,
@@ -394,24 +417,53 @@ def start_training():
         normalize_t=not opt.no_norm_tfeat,
         clip_len=opt.clip_length,
         max_windows=opt.max_windows,
+        load_labels=True,
         span_loss_type=opt.span_loss_type,
         txt_drop_ratio=opt.txt_drop_ratio,
         dset_domain=opt.dset_domain,
     )
-    dataset_config["data_path"] = opt.train_path
-    train_dataset = StartEndDataset(**dataset_config)
-    torch.autograd.set_detect_anomaly(True)
-    if opt.eval_path is not None:
-        dataset_config["data_path"] = opt.eval_path
-        dataset_config["txt_drop_ratio"] = 0
-        dataset_config["q_feat_dir"] = opt.t_feat_dir.replace("sub_features", "text_features")  # for pretraining
-        # dataset_config["load_labels"] = False  # uncomment to calculate eval loss
 
-        eval_dataset = StartEndDataset(**dataset_config)
+    eval_dataset = StartEndDataset(
+        dset_name=opt.dset_name,
+        data_path=opt.eval_path,
+        v_feat_dirs=opt.v_feat_dirs,
+        q_feat_dir=opt.t_feat_dir,
+        q_feat_type=opt.q_feat_type,
+        max_q_l=opt.max_q_l,
+        max_v_l=opt.max_v_l,
+        ctx_mode=opt.ctx_mode,
+        data_ratio=opt.data_ratio,
+        normalize_v=not opt.no_norm_vfeat,
+        normalize_t=not opt.no_norm_tfeat,
+        clip_len=opt.clip_length,
+        max_windows=opt.max_windows,
+        load_labels=True,
+        span_loss_type=opt.span_loss_type,
+        txt_drop_ratio=0,
+        dset_domain=opt.dset_domain,
+    )
 
-    else:
-        eval_dataset = None
+    test_dataset = StartEndDataset(
+        dset_name=opt.dset_name,
+        data_path=opt.test_path,
+        v_feat_dirs=opt.v_feat_dirs,
+        q_feat_dir=opt.t_feat_dir,
+        q_feat_type=opt.q_feat_type,
+        max_q_l=opt.max_q_l,
+        max_v_l=opt.max_v_l,
+        ctx_mode=opt.ctx_mode,
+        data_ratio=opt.data_ratio,
+        normalize_v=not opt.no_norm_vfeat,
+        normalize_t=not opt.no_norm_tfeat,
+        clip_len=opt.clip_length,
+        max_windows=opt.max_windows,
+        load_labels=True,
+        span_loss_type=opt.span_loss_type,
+        txt_drop_ratio=0,
+        dset_domain=opt.dset_domain,
+    )
 
+    # setup model
     model, criterion, optimizer, lr_scheduler = setup_model(opt)
     logger.info(f"Model {model}")
     params = []
@@ -433,7 +485,7 @@ def start_training():
     if opt.dset_name in ['tvsum', 'youtube_uni']:
         train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, eval_dataset, opt)
     else:
-        train(model, criterion, optimizer, lr_scheduler, train_dataset, eval_dataset, opt)
+        train(model, criterion, optimizer, lr_scheduler, train_dataset, eval_dataset, test_dataset, opt)
     return (
         opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"),
         opt.eval_split_name,

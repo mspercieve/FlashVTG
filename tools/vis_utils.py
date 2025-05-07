@@ -5,6 +5,8 @@ import numpy as np
 from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
 import matplotlib.pyplot as plt
+import nncore
+from nncore.ops import temporal_iou
 
 
 def get_chunk_ranges(total_frames, num_chunks=3):
@@ -232,23 +234,26 @@ def visualize_similarity_matrix(tokens, t_sim, t_proj_sim, qd_t_proj_sim, query_
     else:
         plt.show()
 
-def visualize_phrase_and_context(query, tokens, sqan_attn, context_emb, context_agg, vid_emb, moment_gt=None, pred_boundary=None, save_path=None):
+def visualize_phrase_and_context(query, tokens, sqan_attn, context_emb, context_refine, context_agg, vid_emb, moment_gt=None, pred_boundary=None, save_path=None, slot_att=None):
     """
     query: str - input text query
     tokens: list of str - tokenized words from the query (length L)
     sqan_attn: np.ndarray [N, L] - SQAN attention scores
     context_emb: np.ndarray [N, T, C] - context embedding scores
+    context_refine: np.ndarray [N, T, C] - context refined scores
     context_agg: np.ndarray [N, T, C] - context aggregated scores
     vid_emb: np.ndarray [T, C] - video embedding
     moment_gt: list of tuples - ground truth moments [(start1, end1), (start2, end2), ...]
     pred_boundary: np.ndarray - model predictions [N, 3] (start, end, score)
     save_path: str or None - if set, save the figure
+    slot_att: np.ndarray [N, L] - phrase slot attention scores
     """
     N, L = sqan_attn.shape
     N, T, C = context_emb.shape
     
     # Context activation과 Video embedding의 L2 norm 계산
     context_norm = np.linalg.norm(context_emb, axis=-1)  # [N, T]
+    context_refine_norm = np.linalg.norm(context_refine, axis=-1)  # [N, T]
     context_agg_norm = np.linalg.norm(context_agg, axis=-1)  # [T]
     vid_norm = np.linalg.norm(vid_emb, axis=-1)  # [T]
     
@@ -256,9 +261,13 @@ def visualize_phrase_and_context(query, tokens, sqan_attn, context_emb, context_
     context_agg_norm = context_agg_norm[np.newaxis, :]  # [1, T]로 변환
     vid_norm = vid_norm[np.newaxis, :]  # [1, T]로 변환
     
-    # 4개의 subplot 생성
+    # subplot 개수 결정 (slot_att가 있으면 6개, 없으면 5개)
+    n_subplots = 6 if slot_att is not None else 5
+    height_ratios = [N, N, N, N, 1, 1] if slot_att is not None else [N, N, N, 1, 1]
+    
+    # subplot 생성
     fig = plt.figure(figsize=(20, 15))
-    gs = fig.add_gridspec(4, 1, height_ratios=[1, 1, 1, 1])
+    gs = fig.add_gridspec(n_subplots, 1, height_ratios=height_ratios)
     
     # 1. Phrase Attention 히트맵
     ax1 = fig.add_subplot(gs[0])
@@ -273,86 +282,181 @@ def visualize_phrase_and_context(query, tokens, sqan_attn, context_emb, context_
     cbar1.set_label('Attention Score')
     ax1.set_title("Phrase-Word Attention", fontsize=12, pad=10)
     
+    # 2. Phrase Slot Attention 히트맵 (slot_att가 있는 경우)
+    if slot_att is not None:
+        ax2 = fig.add_subplot(gs[1])
+        im2 = ax2.imshow(slot_att, aspect='auto', cmap='Greys')
+        ax2.set_yticks(np.arange(N))
+        ax2.set_yticklabels([f"Phrase {n+1}" for n in range(N)])
+        ax2.set_xticks(np.arange(L))
+        ax2.set_xticklabels([f"{i}:{tok}" for i, tok in enumerate(clean_tokens)], 
+                            rotation=45, ha='right', position=(0, 1.1))
+        cbar2 = plt.colorbar(im2, ax=ax2)
+        cbar2.set_label('Attention Score')
+        ax2.set_title("Phrase Slot Attention", fontsize=12, pad=10)
+    
     # x축 tick 설정 수정
     tick_positions = np.linspace(0, T-1, 10, dtype=int)
     tick_labels = [str(pos) for pos in tick_positions]
     
-    # 2. Context activation L2 norm 히트맵
-    ax2 = fig.add_subplot(gs[1])
-    im2 = ax2.imshow(context_norm, aspect='auto', cmap='YlOrRd')
-    ax2.set_yticks(np.arange(N))
-    ax2.set_yticklabels([f"Phrase {n+1}" for n in range(N)])
-    ax2.set_xticks(tick_positions)
-    ax2.set_xticklabels(tick_labels)
-    cbar2 = plt.colorbar(im2, ax=ax2)
-    cbar2.set_label('L2 Norm')
-    ax2.set_title("Context Activation (L2 Norm)", fontsize=12, pad=10)
-    
-    # 3. Context Aggregation L2 norm 히트맵
-    ax3 = fig.add_subplot(gs[2])
-    im3 = ax3.imshow(context_agg_norm, aspect='auto', cmap='YlOrRd')
-    ax3.set_yticks([])  # y축 레이블 제거
+    # 3. Context activation L2 norm 히트맵
+    ax3 = fig.add_subplot(gs[2 if slot_att is not None else 1])
+    im3 = ax3.imshow(context_norm, aspect='auto', cmap='YlOrRd')
+    ax3.set_yticks(np.arange(N))
+    ax3.set_yticklabels([f"Phrase {n+1}" for n in range(N)])
     ax3.set_xticks(tick_positions)
     ax3.set_xticklabels(tick_labels)
     cbar3 = plt.colorbar(im3, ax=ax3)
     cbar3.set_label('L2 Norm')
-    ax3.set_title("Context Aggregation (L2 Norm)", fontsize=12, pad=10)
+    ax3.set_title("Context Activation (L2 Norm)", fontsize=12, pad=10)
     
-    # 4. Video embedding L2 norm 히트맵
-    ax4 = fig.add_subplot(gs[3])
-    im4 = ax4.imshow(vid_norm, aspect='auto', cmap='YlOrRd')
-    ax4.set_yticks([])  # y축 레이블 제거
+    # 4. Context Refined L2 norm 히트맵
+    ax4 = fig.add_subplot(gs[3 if slot_att is not None else 2])
+    im4 = ax4.imshow(context_refine_norm, aspect='auto', cmap='YlOrRd')
+    ax4.set_yticks(np.arange(N))
+    ax4.set_yticklabels([f"Phrase {n+1}" for n in range(N)])
     ax4.set_xticks(tick_positions)
     ax4.set_xticklabels(tick_labels)
     cbar4 = plt.colorbar(im4, ax=ax4)
     cbar4.set_label('L2 Norm')
-    ax4.set_title("Video Embedding Activation (L2 Norm)", fontsize=12, pad=10)
+    ax4.set_title("Context Refined (L2 Norm)", fontsize=12, pad=10)
+    
+    # 5. Context Aggregation L2 norm 히트맵
+    ax5 = fig.add_subplot(gs[4 if slot_att is not None else 3])
+    im5 = ax5.imshow(context_agg_norm, aspect='auto', cmap='YlOrRd')
+    ax5.set_yticks([])  # y축 레이블 제거
+    ax5.set_xticks(tick_positions)
+    ax5.set_xticklabels(tick_labels)
+    cbar5 = plt.colorbar(im5, ax=ax5)
+    cbar5.set_label('L2 Norm')
+    ax5.set_title("Context Aggregation (L2 Norm)", fontsize=12, pad=10)
+    
+    # 6. Video embedding L2 norm 히트맵
+    ax6 = fig.add_subplot(gs[5 if slot_att is not None else 4])
+    im6 = ax6.imshow(vid_norm, aspect='auto', cmap='YlOrRd')
+    ax6.set_yticks([])  # y축 레이블 제거
+    ax6.set_xticks(tick_positions)
+    ax6.set_xticklabels(tick_labels)
+    cbar6 = plt.colorbar(im6, ax=ax6)
+    cbar6.set_label('L2 Norm')
+    ax6.set_title("Video Embedding Activation (L2 Norm)", fontsize=12, pad=10)
     
     # GT moment 구간을 activation map에 표시
     if moment_gt is not None:
         for start, end in moment_gt:
             # Context activation 히트맵에 박스 추가
-            rect2 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
-                                fill=False, edgecolor='black', linewidth=3)
-            ax2.add_patch(rect2)
-            
-            # Context aggregation 히트맵에 박스 추가
-            rect3 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
+            rect3 = plt.Rectangle((start, -0.5), end-start, N, 
                                 fill=False, edgecolor='black', linewidth=3)
             ax3.add_patch(rect3)
             
-            # Video embedding 히트맵에 박스 추가
-            rect4 = plt.Rectangle((start-0.5, -0.5), end-start+1, 1, 
+            # Context refined 히트맵에 박스 추가
+            rect4 = plt.Rectangle((start, -0.5), end-start, N, 
                                 fill=False, edgecolor='black', linewidth=3)
             ax4.add_patch(rect4)
+            
+            # Context aggregation 히트맵에 박스 추가
+            rect5 = plt.Rectangle((start, -0.5), end-start, N, 
+                                fill=False, edgecolor='black', linewidth=3)
+            ax5.add_patch(rect5)
+            
+            # Video embedding 히트맵에 박스 추가
+            rect6 = plt.Rectangle((start, -0.5), end-start, 1, 
+                                fill=False, edgecolor='black', linewidth=3)
+            ax6.add_patch(rect6)
     
     # 모델 예측 구간을 activation map에 표시
     if pred_boundary is not None:
-        num_preds = len(moment_gt) if moment_gt is not None else 1  # GT 개수만큼만 표시
-        for i in range(num_preds):
-            start, end = int(pred_boundary[i][0]), int(pred_boundary[i][1])
-            # Context activation 히트맵에 점선 추가
-            rect2 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
-                                fill=False, edgecolor='blue', linewidth=2, linestyle='--')
-            ax2.add_patch(rect2)
+        # GT moment와 pred moment 정보를 표시하는 텍스트 박스 추가
+        moment_info = []
+        
+        # GT moment 정보 추가
+        if moment_gt is not None:
+            gt_moments = [f"[{start:.1f}~{end:.1f}]" for start, end in moment_gt]
+            moment_info.append("GT moments: " + " | ".join(gt_moments))
+        
+        # Pred moment 정보 추가 (GT moment 개수만큼만)
+        if pred_boundary is not None:
+            # NMS 적용
+            nms_threshold = 0.7
+            num_preds = len(pred_boundary)
+            scores = pred_boundary[:, 2]
+            indices = np.argsort(scores)[::-1]  # 내림차순 정렬
+            pred_boundary = pred_boundary[indices]
             
-            # Context aggregation 히트맵에 점선 추가
-            rect3 = plt.Rectangle((start-0.5, -0.5), end-start+1, N, 
-                                fill=False, edgecolor='blue', linewidth=2, linestyle='--')
-            ax3.add_patch(rect3)
+            # NMS 적용
+            keep = []
+            for i in range(num_preds):
+                if i == 0:
+                    keep.append(i)
+                    continue
+                # numpy array를 tensor로 변환
+                current_box = torch.from_numpy(pred_boundary[i:i+1, :2]).float()
+                kept_boxes = torch.from_numpy(pred_boundary[keep, :2]).float()
+                iou = temporal_iou(current_box, kept_boxes)[0]
+                if iou.max() < nms_threshold:
+                    keep.append(i)
             
-            # Video embedding 히트맵에 점선 추가
-            rect4 = plt.Rectangle((start-0.5, -0.5), end-start+1, 1, 
-                                fill=False, edgecolor='blue', linewidth=2, linestyle='--')
-            ax4.add_patch(rect4)
+            pred_boundary = pred_boundary[keep]
+            
+            # GT moment 개수만큼만 선택
+            num_preds = len(moment_gt) if moment_gt is not None else 1
+            pred_boundary = pred_boundary[:num_preds]
+            
+            pred_moments = []
+            for i in range(len(pred_boundary)):
+                start, end = float(pred_boundary[i][0]), float(pred_boundary[i][1])
+                # clip_length로 나누기
+                start = start / 2  # clip_length가 2라고 가정
+                end = end / 2
+                pred_moments.append(f"[{start:.1f}~{end:.1f}]")
+            moment_info.append("Pred moments: " + " | ".join(pred_moments))
+        
+        # moment 정보를 텍스트로 표시
+        moment_text = "\n".join(moment_info)
+        plt.figtext(0.5, 0.98, moment_text, ha='center', fontsize=12, 
+                    bbox=dict(facecolor='white', alpha=0.8))
+        
+        # 토큰 정보를 표시하는 텍스트 박스 추가
+        token_text = "Tokens: " + " ".join([f"{i}:{tok}" for i, tok in enumerate(clean_tokens)])
+        plt.figtext(0.5, 0.01, token_text, ha='center', fontsize=10, 
+                    bbox=dict(facecolor='white', alpha=0.8))
+        
+        # 모델 예측 구간을 activation map에 표시
+        if pred_boundary is not None:
+            # GT moment 개수만큼만 예측 표시
+            num_preds = len(moment_gt) if moment_gt is not None else 1
+            for i in range(num_preds):
+                # boundary는 [start, end, score] 형태
+                start, end = float(pred_boundary[i][0]), float(pred_boundary[i][1])
+                # clip_length로 나누기
+                start = start / 2  # clip_length가 2라고 가정
+                end = end / 2
+                # 0과 duration 사이로 제한
+                start = max(0, start)
+                end = min(T-1, end)  # T는 전체 프레임 수
+                
+                # Context activation 히트맵에 점선 추가
+                rect3 = plt.Rectangle((start, -0.5), end-start, N, 
+                                    fill=False, edgecolor='blue', linewidth=2, linestyle='--')
+                ax3.add_patch(rect3)
+                
+                # Context refined 히트맵에 점선 추가
+                rect4 = plt.Rectangle((start, -0.5), end-start, N, 
+                                    fill=False, edgecolor='blue', linewidth=2, linestyle='--')
+                ax4.add_patch(rect4)
+                
+                # Context aggregation 히트맵에 점선 추가
+                rect5 = plt.Rectangle((start, -0.5), end-start, N, 
+                                    fill=False, edgecolor='blue', linewidth=2, linestyle='--')
+                ax5.add_patch(rect5)
+                
+                # Video embedding 히트맵에 점선 추가
+                rect6 = plt.Rectangle((start, -0.5), end-start, 1, 
+                                    fill=False, edgecolor='blue', linewidth=2, linestyle='--')
+                ax6.add_patch(rect6)
     
     # 전체 제목 설정
     fig.suptitle(f"Query: {query}", fontsize=14, y=1.02)
-    
-    # 토큰 정보를 표시하는 텍스트 박스 추가
-    token_text = "Tokens: " + " ".join([f"{i}:{tok}" for i, tok in enumerate(clean_tokens)])
-    plt.figtext(0.5, 0.01, token_text, ha='center', fontsize=10, 
-                bbox=dict(facecolor='white', alpha=0.8))
     
     if save_path:
         plt.savefig(save_path, bbox_inches='tight')
