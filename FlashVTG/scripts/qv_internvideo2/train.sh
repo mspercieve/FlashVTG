@@ -12,7 +12,7 @@ eval_split_name=val
 
 ######## setup video+text features
 # video features
-v_feat_dirs=/home/caozhuo/data_ssd/qvhighlights_internvideo2/qvhighlight_6b/
+v_feat_dirs=/SSD1/minseok/MR_HD/DB/features/internvid_features/qvhighlights/stage2_video/fps2/l40_vid_pool/
 v_feat_dim=768
 
 # text features

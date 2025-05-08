@@ -216,7 +216,6 @@ class LowRankDynamicConv(nn.Module):
         self.rank = rank
         self.t_kernels = t_kernels
 
-        #self.phrase_proj = nn.Linear(num_phrase * hdim, num_phrase * hdim * rank)
         self.phrase_proj = nn.Linear(hdim, hdim * rank)
         self.kernel_params = nn.ParameterDict()
         for k in t_kernels:
@@ -254,7 +253,7 @@ class LowRankDynamicConv(nn.Module):
         #phrase_emb = phrase_emb.view(B, N*C)
         #phrase_proj = self.phrase_proj(phrase_emb)
         #phrase_proj = rearrange(phrase_proj, 'b (n c r) -> b n c r', n=N, c=C, r=self.rank)
-
+        #phrase_emb = rearrange(phrase_emb, 'b n c -> b (n c)')
         phrase_proj = self.phrase_proj(phrase_emb)
         phrase_proj = rearrange(phrase_proj, 'b n (c r) -> b n c r', c=C, r=self.rank)
 
@@ -421,13 +420,7 @@ class PhraseContextLayer(nn.Module):
         context_emb, _ = self.t_att(context_emb, vid_mask) # [B*N, T, C]
         t_update = self.fc_t(context_emb) # [B*N, T, C]
         context_emb = self.norm_t(context_emb + t_update) # [B*N, T, C]
-        #context_emb = rearrange(context_emb, '(b n) t c -> b t n c', b=B, n=N)
-        #context_emb = rearrange(context_emb, '(b n) t c -> (b t) n c', b=B, n=N) # [B*T, N, C]
-        # N-axis self-attention
-        #context_att, _ = self.n_att(context_emb, None) # [B*T,N,C]
-        #context_emb = rearrange(context_att, '(b t) n c -> (b n) t c', b=B, n=N) # [B*N, T, C]
-        #n_update = self.fc_n(context_emb)
-        #context_emb = self.norm_n(context_emb + n_update)
+
 
         return context_emb
 
@@ -470,42 +463,6 @@ class Phrase_Context(nn.Module):
         context_agg = self.local_context(context_emb, phrase_slot)
         return context_agg
 
-class PhraseContext_NAT(nn.Module):
-    def __init__(self, hdim, num_layers, nheads, dropout=0.1, num_phrase=3, rank=32, t_kernels=(3,5,7)):
-        super(PhraseContext_NAT, self).__init__()
-        self.hdim = hdim
-        self.num_layers = num_layers
-        self.layers = nn.ModuleList([ContextNAT_dynamic(hdim, nheads, k_size=t, rank=rank, dropout=dropout) for t in t_kernels])
-        self.dropout = nn.Dropout(dropout)
-        self.rank = rank
-
-
-        self.product = HadamardProduct(hdim, hdim, hdim)
-        self.pos = PositionEmbeddingSine(hdim)
-        self.context_agg = LowRankDynamicProjector(hdim, rank)
-
-    def forward(self, phrase_slot, vid_feat, vid_mask):
-        """
-        Args:
-            phrase_slot: [B, N, C] phrase slots
-            vid_feat: [B, T, C] video-level features
-        Returns:
-            updated_phrase: [B, T, N, C]
-        """
-        B, T, C = vid_feat.shape
-        N = phrase_slot.shape[1]
-        
-        context_emb = self.product([vid_feat, phrase_slot]) # [B T N C]
-        pos = self.pos(vid_feat, vid_mask) # B T C
-        pos = pos.unsqueeze(2).expand(-1, -1, N, -1)
-        context_emb = context_emb + pos
-        vid_mask = vid_mask.unsqueeze(-1).expand(-1, -1, N)
-
-        for layer in self.layers:
-            context_emb = layer(context_emb, phrase_slot, vid_mask) # B T N C
-
-        context_agg = self.context_agg(phrase_slot, context_emb)
-        return context_agg    
 
 
 class HadamardProduct(nn.Module):

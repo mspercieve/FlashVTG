@@ -2,6 +2,8 @@ import pprint
 from tqdm import tqdm, trange
 import numpy as np
 import os
+import sys
+sys.path.append('/SSD1/minseok/MR_HD/FlashVTG')
 from collections import defaultdict
 from utils.basic_utils import AverageMeter
 
@@ -10,14 +12,15 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 
-from FlashVTG.config import TestOptions
-from FlashVTG.start_end_dataset import (
+from FlashVTG_ms.config import TestOptions
+from FlashVTG_ms.start_end_dataset import (
     StartEndDataset,
     start_end_collate,
     prepare_batch_inputs,
 )
-from FlashVTG.postprocessing import PostProcessorDETR
+from FlashVTG_ms.postprocessing import PostProcessorDETR
 from standalone_eval.eval import eval_submission
+
 from utils.basic_utils import save_jsonl, save_json
 
 import nncore
@@ -462,16 +465,16 @@ def setup_model(opt):
         new_state_dict = OrderedDict()
         if "pt" in opt.resume[:-4]:
             if "asr" in opt.resume[:25]:
-                model.load_state_dict(checkpoint["model"])
+                model.load_state_dict(checkpoint["model"], strict=False)
             else:
                 for k, v in checkpoint["state_dict"].items():
                     name = k[7:]  # remove `module.`
                     new_state_dict[name] = v
                 # model.load_state_dict(checkpoint["model"])
-                model.load_state_dict(new_state_dict)
+                model.load_state_dict(new_state_dict, strict=False)
         else:
             # model.load_state_dict(checkpoint["state_dict"])
-            model.load_state_dict(checkpoint["model"], strict=True)
+            model.load_state_dict(checkpoint["model"], strict=False)
         if opt.resume_all:
             optimizer.load_state_dict(checkpoint["optimizer"])
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
@@ -552,6 +555,7 @@ from sys import argv
 
 if __name__ == "__main__":
     # split, splitfile = argv
-    _, _, _, _, _, split, _, splitfile = argv
-
+    #_, _, _, _, _, split, _, splitfile = argv
+    split = 'val'
+    splitfile = '/SSD1/minseok/MR_HD/FlashVTG/data/highlight_val_release.jsonl'
     start_inference(split=split, splitfile=splitfile)

@@ -131,7 +131,7 @@ class BaseOptions(object):
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
         parser.add_argument("--temperature", type=float, default=0.07, help="temperature nce contrastive_align_loss")
         # LGI
-        parser.add_argument("--num_phrase", type=int, default=3, help="number of phrases")
+        parser.add_argument("--num_phrase", type=int, default=4, help="number of phrases")
         parser.add_argument("--phrase_layers", type=int, default=2, help="number of phrase layers")
         parser.add_argument("--context_layers", type=int, default=2, help="number of context layers")
         parser.add_argument('--use_dfl', action="store_true")

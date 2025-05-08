@@ -25,6 +25,7 @@ from utils.basic_utils import AverageMeter, dict_to_markdown
 import nncore
 from datetime import datetime
 import logging
+import argparse
 
 def set_seed(seed, use_cuda=True):
     random.seed(seed)
@@ -107,12 +108,19 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
     
     return losses, epoch_i * num_training_examples + batch_idx
 
+def get_wandb_run_name(opt):
+    if hasattr(opt, 'wandb_run_name') and opt.wandb_run_name:
+        return opt.wandb_run_name
+    # 자동 생성
+    return f"N{opt.num_phrase}_NL{opt.phrase_layers}_CL{opt.context_layers}_R{opt.rank}"
+
 def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt):
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")
         model.to(opt.device)
 
-    wandb.init(project="FlashVTG", entity="msperceive", sync_tensorboard=True)
+    run_name = get_wandb_run_name(opt)
+    wandb.init(project="FlashVTG", entity="msperceive", sync_tensorboard=True, name=run_name)
     tb_writer = SummaryWriter(log_dir=wandb.run.dir)
     tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
@@ -248,7 +256,8 @@ def train_hl(
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")
         model.to(opt.device)
-    wandb.init(project="FlashVTG", entity="msperceive")
+    run_name = get_wandb_run_name(opt)
+    wandb.init(project="FlashVTG", entity="msperceive", name=run_name)
     tb_writer = SummaryWriter(log_dir=wandb.run.dir)
     tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
@@ -435,7 +444,12 @@ def start_training():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name')
+    args, unknown = parser.parse_known_args()
     opt = BaseOptions().parse()
+    if args.wandb_run_name is not None:
+        opt.wandb_run_name = args.wandb_run_name
     set_seed(opt.seed)
     if opt.debug:  # keep the model run deterministically
         # 'cudnn.benchmark = True' enabled auto finding the best algorithm for a specific input/net config.
