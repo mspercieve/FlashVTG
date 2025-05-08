@@ -425,33 +425,38 @@ class SetCriterion(nn.Module):
         P = torch.norm(torch.bmm(attw, attw_T) - I, p="fro", dim=[1,2], keepdim=True)
         da_loss = (P**2).mean()
 
-        # 2. Word Coverage Loss
-        # 각 단어가 최소한 하나의 phrase에 할당되도록
-        word_coverage = attw.sum(dim=1)  # [B, L] - 각 단어가 모든 phrase에 할당된 정도
-        min_coverage = 0.2  # 최소 coverage threshold
-        coverage_loss = F.relu(min_coverage - word_coverage).mean()
-
-        total_loss = da_loss + 0.1 * coverage_loss
+        total_loss = da_loss
         return {"loss_phrase_slot": total_loss}
 
     def loss_eos(self, outputs, targets, log=True):
         eos_slot = outputs["eos_slot"]  # [B, 1, C]
         eos_emb = outputs["eos_emb"]    # [B, 1, C]
-        
-        # 정규화
         eos_slot = F.normalize(eos_slot.squeeze(1), dim=-1)  # [B, C]
         eos_emb = F.normalize(eos_emb.squeeze(1), dim=-1)    # [B, C]
-        
-        # 유사도 행렬 계산 [B, B]
+
+        # 1. EOS-EOS InfoNCE (기존)
         temperature = 0.1
         logits = torch.matmul(eos_slot, eos_emb.T) / temperature
-        
-        # 각 샘플의 positive pair는 자기 자신
         labels = torch.arange(logits.size(0), device=logits.device)
-        
-        # InfoNCE loss
-        loss = F.cross_entropy(logits, labels)
-        
+        loss_eos_eos = F.cross_entropy(logits, labels)
+
+        # 2. EOS-Positive Clip InfoNCE
+        # context_agg: [B, T, C], saliency_pos_labels: [B, K] (K=positive 개수)
+        context_agg = outputs["context_agg"]  # [B, T, C]
+        pos_clip_idx = targets["saliency_pos_labels"][:, 0]  # [B] (가장 첫 positive만 사용)
+        B, T, C = context_agg.shape
+
+        # positive clip feature 추출
+        pos_clip_feat = context_agg[torch.arange(B), pos_clip_idx]  # [B, C]
+        pos_clip_feat = F.normalize(pos_clip_feat, dim=-1)
+
+        # eos_slot과 positive clip 간 cosine similarity
+        logits2 = torch.matmul(eos_slot, pos_clip_feat.T) / temperature
+        labels2 = torch.arange(logits2.size(0), device=logits2.device)
+        loss_eos_pos = F.cross_entropy(logits2, labels2)
+
+        # 최종 loss
+        loss = loss_eos_eos + loss_eos_pos
         return {"loss_eos": loss}
 
     def loss_labels(self, outputs, targets, log=True):
@@ -618,7 +623,6 @@ class SetCriterion(nn.Module):
             "labels": self.loss_labels,
             "saliency": self.loss_saliency,
             "sal": self.loss_sal,
-            "phrase_sqan": self.loss_phrase_sqan,
             "phrase_slot": self.loss_phrase_slot,
             "eos": self.loss_eos,
             "cls": self.loss_cls,

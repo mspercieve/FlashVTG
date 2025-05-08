@@ -197,8 +197,20 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                 tb_writer.add_scalar(f"Val/{k}", float(v), epoch_i + 1)
 
             # Save best model
-            if metrics["brief"]["mAP"] > prev_best_score:
-                prev_best_score = metrics["brief"]["mAP"]
+            if opt.dset_name in ["hl"]:
+                stop_score = metrics["brief"]["MR-full-mAP"]
+            elif opt.dset_name in ["tacos"]:
+                stop_score = metrics["brief"]["MR-full-R1@0.3"]
+            elif opt.dset_name in ["tvsum", "youtube_uni"]:
+                stop_score = metrics["brief"]["mAP"]
+            else:
+                stop_score = (
+                    metrics["brief"]["MR-full-R1@0.7"]
+                    + metrics["brief"]["MR-full-R1@0.5"]
+                ) / 2
+
+            if stop_score > prev_best_score:
+                prev_best_score = stop_score
                 es_cnt = 0
                 checkpoint = {
                     "model": model.state_dict(),
@@ -274,12 +286,22 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
         logger.info("Latest model test metrics_nms: {}".format(pprint.pformat(metrics_nms["brief"], indent=4)))
 
 def train_hl(
-    model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt
+    model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, test_dataset, opt
 ):
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")
         model.to(opt.device)
-    wandb.init(project="FlashVTG", entity="msperceive")
+
+    N_phrase = opt.num_phrase
+    N_layer = opt.phrase_layers
+    C_layer = opt.context_layers
+    rank = opt.rank
+
+    contribution = "T_kernel_channels"
+
+    run_name = f"{contribution}_Nphrase{N_phrase}_Nlayer{N_layer}_Clayer{C_layer}_rank{rank}"
+
+    wandb.init(project="FlashVTG", name = run_name, entity="msperceive", sync_tensorboard=True)
     tb_writer = SummaryWriter(log_dir=wandb.run.dir)
     tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
@@ -291,42 +313,40 @@ def train_hl(
         batch_size=opt.bsz,
         num_workers=opt.num_workers,
         shuffle=True,
-        pin_memory=opt.pin_memory,
-        drop_last=opt.drop_last,
+        pin_memory=opt.pin_memory
     )
 
     prev_best_score = 0.0
-    es_cnt = 0
-    # start_epoch = 0
+    es_cnt = 0  # early stop counter
     if opt.start_epoch is None:
         start_epoch = -1 if opt.eval_untrained else 0
     else:
         start_epoch = opt.start_epoch
-    save_submission_filename = "latest_{}_{}_preds.jsonl".format(
-        opt.dset_name, opt.eval_split_name
-    )
+    
     for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
         if epoch_i > -1:
-            train_epoch(
+            losses, iteration = train_epoch(
                 model, criterion, train_loader, optimizer, opt, epoch_i, tb_writer
             )
-            lr_scheduler.step() # use step() for StepLR not ReduceLROnPlateau
+            lr_scheduler.step(losses)
         eval_epoch_interval = opt.eval_epoch
+
         if opt.eval_path is not None and (epoch_i + 1) % eval_epoch_interval == 0:
+            # Validation
             with torch.no_grad():
                 metrics_no_nms, metrics_nms, eval_loss_meters, latest_file_paths = (
                     eval_epoch(
                         model,
                         val_dataset,
                         opt,
-                        save_submission_filename,
+                        f"val_latest_{opt.dset_name}_preds.jsonl",
                         epoch_i,
                         criterion,
                         tb_writer,
                     )
                 )
 
-            # log
+            # log validation results
             to_write = opt.eval_log_txt_formatter.format(
                 time_str=time.strftime("%Y_%m_%d_%H_%M_%S"),
                 epoch=epoch_i,
@@ -339,65 +359,107 @@ def train_hl(
             with open(opt.eval_log_filepath, "a") as f:
                 f.write(to_write)
             logger.info(
-                "metrics_no_nms {}".format(
+                "Validation metrics_no_nms {}".format(
                     pprint.pformat(metrics_no_nms["brief"], indent=4)
                 )
             )
             if metrics_nms is not None:
                 logger.info(
-                    "metrics_nms {}".format(
+                    "Validation metrics_nms {}".format(
                         pprint.pformat(metrics_nms["brief"], indent=4)
                     )
                 )
+                with open(opt.eval_log_filepath, "a") as f:
+                    f.write("Validation metrics_nms {}\n".format(pprint.pformat(metrics_nms["brief"], indent=4)))
 
             metrics = metrics_no_nms
             for k, v in metrics["brief"].items():
-                tb_writer.add_scalar(f"Eval/{k}", float(v), epoch_i + 1)
+                tb_writer.add_scalar(f"Val/{k}", float(v), epoch_i + 1)
 
-            stop_score = metrics["brief"]["mAP"]
+            # Save best model
+            if opt.dset_name in ["hl"]:
+                stop_score = metrics["brief"]["MR-full-mAP"]
+            elif opt.dset_name in ["tacos"]:
+                stop_score = metrics["brief"]["MR-full-R1@0.3"]
+            elif opt.dset_name in ["tvsum", "youtube_uni"]:
+                stop_score = metrics["brief"]["mAP"]
+            else:
+                stop_score = (
+                    metrics["brief"]["MR-full-R1@0.7"]
+                    + metrics["brief"]["MR-full-R1@0.5"]
+                ) / 2
+
             if stop_score > prev_best_score:
-                es_cnt = 0
                 prev_best_score = stop_score
-
+                es_cnt = 0
                 checkpoint = {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
                     "epoch": epoch_i,
                     "opt": opt,
                 }
                 torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"))
-
-                best_file_paths = [
-                    e.replace("latest", "best") for e in latest_file_paths
-                ]
-                for src, tgt in zip(latest_file_paths, best_file_paths):
-                    os.renames(src, tgt)
-                logger.info("The checkpoint file has been updated.")
+                logger.info("Saved best model checkpoint to [{}]".format(opt.ckpt_filepath.replace(".ckpt", "_best.ckpt")))
             else:
                 es_cnt += 1
-                if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:  # early stop
-                    with open(opt.train_log_filepath, "a") as f:
-                        f.write(f"Early Stop at epoch {epoch_i}")
+                if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:
                     logger.info(
-                        f"\n>>>>> Early stop at epoch {epoch_i}  {prev_best_score}\n"
+                        "Early stop, val score = {:.4f}".format(prev_best_score)
                     )
                     break
 
-            # save ckpt
-            checkpoint = {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "lr_scheduler": lr_scheduler.state_dict(),
-                "epoch": epoch_i,
-                "opt": opt,
-            }
-            torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_latest.ckpt"))
+        # Test - only save predictions without evaluation
+        if opt.test_path is not None and (epoch_i + 1) % eval_epoch_interval == 0:
+            with torch.no_grad():
+                _, _, _, latest_file_paths = (
+                    eval_epoch(
+                        model,
+                        test_dataset,
+                        opt,
+                        f"test_latest_{opt.dset_name}_preds.jsonl",
+                        epoch_i,
+                        criterion,
+                        tb_writer,
+                        eval_mode=False  # Don't compute metrics
+                    )
+                )
+            logger.info(f"Saved test predictions to {latest_file_paths[0]}")
+
+        # Save latest model
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch_i,
+            "opt": opt,
+        }
+        torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_latest.ckpt"))
 
         if opt.debug:
             break
 
     tb_writer.close()
+
+    # Final evaluation on validation set only
+    logger.info("\n\nEvaluating best model...")
+    checkpoint = torch.load(opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"))
+    model.load_state_dict(checkpoint["model"])
+    
+    # Validation set evaluation
+    with torch.no_grad():
+        metrics_no_nms, metrics_nms, eval_loss_meters, _ = eval_epoch(
+            model, val_dataset, opt, f"val_best_{opt.dset_name}_preds.jsonl", epoch_i, criterion, tb_writer
+        )
+    logger.info("Best model validation metrics_no_nms: {}".format(pprint.pformat(metrics_no_nms["brief"], indent=4)))
+    if metrics_nms is not None:
+        logger.info("Best model validation metrics_nms: {}".format(pprint.pformat(metrics_nms["brief"], indent=4)))
+    
+    # Test set - only save predictions
+    if opt.test_path is not None:
+        with torch.no_grad():
+            _, _, _, _ = eval_epoch(
+                model, test_dataset, opt, f"test_best_{opt.dset_name}_preds.jsonl", epoch_i, criterion, tb_writer, eval_mode=False
+            )
+        logger.info(f"Saved final test predictions to test_best_{opt.dset_name}_preds.jsonl")
 
 def start_training():
     logger.info("Setup data and model...")
@@ -423,45 +485,51 @@ def start_training():
         dset_domain=opt.dset_domain,
     )
 
-    eval_dataset = StartEndDataset(
-        dset_name=opt.dset_name,
-        data_path=opt.eval_path,
-        v_feat_dirs=opt.v_feat_dirs,
-        q_feat_dir=opt.t_feat_dir,
-        q_feat_type=opt.q_feat_type,
-        max_q_l=opt.max_q_l,
-        max_v_l=opt.max_v_l,
-        ctx_mode=opt.ctx_mode,
-        data_ratio=opt.data_ratio,
-        normalize_v=not opt.no_norm_vfeat,
-        normalize_t=not opt.no_norm_tfeat,
-        clip_len=opt.clip_length,
-        max_windows=opt.max_windows,
-        load_labels=True,
-        span_loss_type=opt.span_loss_type,
-        txt_drop_ratio=0,
-        dset_domain=opt.dset_domain,
-    )
+    if opt.eval_path is not None:
+        val_dataset = StartEndDataset(
+            dset_name=opt.dset_name,
+            data_path=opt.eval_path,
+            v_feat_dirs=opt.v_feat_dirs,
+            q_feat_dir=opt.t_feat_dir,
+            q_feat_type=opt.q_feat_type,
+            max_q_l=opt.max_q_l,
+            max_v_l=opt.max_v_l,
+            ctx_mode=opt.ctx_mode,
+            data_ratio=opt.data_ratio,
+            normalize_v=not opt.no_norm_vfeat,
+            normalize_t=not opt.no_norm_tfeat,
+            clip_len=opt.clip_length,
+            max_windows=opt.max_windows,
+            load_labels=True,
+            span_loss_type=opt.span_loss_type,
+            txt_drop_ratio=0,
+            dset_domain=opt.dset_domain,
+        )
+    else:
+        val_dataset = None
 
-    test_dataset = StartEndDataset(
-        dset_name=opt.dset_name,
-        data_path=opt.test_path,
-        v_feat_dirs=opt.v_feat_dirs,
-        q_feat_dir=opt.t_feat_dir,
-        q_feat_type=opt.q_feat_type,
-        max_q_l=opt.max_q_l,
-        max_v_l=opt.max_v_l,
-        ctx_mode=opt.ctx_mode,
-        data_ratio=opt.data_ratio,
-        normalize_v=not opt.no_norm_vfeat,
-        normalize_t=not opt.no_norm_tfeat,
-        clip_len=opt.clip_length,
-        max_windows=opt.max_windows,
-        load_labels=True,
-        span_loss_type=opt.span_loss_type,
-        txt_drop_ratio=0,
-        dset_domain=opt.dset_domain,
-    )
+    if opt.test_path is not None:
+        test_dataset = StartEndDataset(
+            dset_name=opt.dset_name,
+            data_path=opt.test_path,
+            v_feat_dirs=opt.v_feat_dirs,
+            q_feat_dir=opt.t_feat_dir,
+            q_feat_type=opt.q_feat_type,
+            max_q_l=opt.max_q_l,
+            max_v_l=opt.max_v_l,
+            ctx_mode=opt.ctx_mode,
+            data_ratio=opt.data_ratio,
+            normalize_v=not opt.no_norm_vfeat,
+            normalize_t=not opt.no_norm_tfeat,
+            clip_len=opt.clip_length,
+            max_windows=opt.max_windows,
+            load_labels=True,
+            span_loss_type=opt.span_loss_type,
+            txt_drop_ratio=0,
+            dset_domain=opt.dset_domain,
+        )
+    else:
+        test_dataset = None
 
     # setup model
     model, criterion, optimizer, lr_scheduler = setup_model(opt)
@@ -483,9 +551,9 @@ def start_training():
 
     # For tvsum dataset, use train_hl function
     if opt.dset_name in ['tvsum', 'youtube_uni']:
-        train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, eval_dataset, opt)
+        train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, test_dataset, opt)
     else:
-        train(model, criterion, optimizer, lr_scheduler, train_dataset, eval_dataset, test_dataset, opt)
+        train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, test_dataset, opt)
     return (
         opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"),
         opt.eval_split_name,
@@ -498,11 +566,9 @@ def start_training():
 if __name__ == "__main__":
     opt = BaseOptions().parse()
     set_seed(opt.seed)
-    if opt.debug:  # keep the model run deterministically
-        # 'cudnn.benchmark = True' enabled auto finding the best algorithm for a specific input/net config.
-        # Enable this only when input size is fixed.
-        cudnn.benchmark = False
-        cudnn.deterministic = True
+    if opt.device.type == "cuda":
+        torch.cuda.set_device(opt.device)
+        cudnn.benchmark = True
 
     opt.cfg = nncore.Config.from_file(opt.config)
 

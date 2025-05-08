@@ -175,8 +175,9 @@ class FlashVTG_ms(nn.Module):
         pos_glob, pos_word = torch.split(pos_txt, [1, pos_txt.size(1)-1], dim=1)
 
         # Phrase Generate
-        phrase_emb, phrase_att, slot_sim, eos_slot = self.phrase_generate(src_txt, src_txt_mask) # [B, N, C]
-        context_agg, context_emb_out, context_refine_out = self.phrase_context(phrase_emb, src_vid, src_vid_mask, eos_slot) # [B, T, C]
+        phrase_emb, word_video_attn, gate, slot_attn = self.phrase_generate(src_txt, src_txt_mask, src_vid, src_vid_mask) # [B, N, C]
+        print(gate[0])
+        context_agg, context_emb_out = self.phrase_context(phrase_emb, src_vid, src_vid_mask) # [B, T, C]
 
         # Dummy Generate
         txt_dummy = self.dummy_rep_token.reshape([1, self.args.num_dummies, self.hidden_dim]).repeat(src_txt.shape[0], 1, 1)
@@ -230,13 +231,10 @@ class FlashVTG_ms(nn.Module):
             output["saliency_scores"] = saliency_scores
             output["t2vattnvalues"] = (attn_weights[:,:,self.args.num_dummies:]).squeeze(2)
             output["t2vattnvalues"] = torch.clamp(output["t2vattnvalues"], 0, 1)
-            output["sqan_att"] = phrase_att
-            output["slot_att"] = slot_sim
-            output["eos_slot"] = eos_slot
-            output["eos_emb"] = src_glob
-            output["context_agg"] = context_agg
+            output["word_video_attn"] = word_video_attn
+            output["slot_att"] = slot_attn
             output["context_emb_out"] = context_emb_out
-            output["context_refine_out"] = context_refine_out
+            output["context_agg"] = context_agg
             output["vid_emb"] = vid_emb
             if self.training == True:
                 output["sim_score"] = sim_score
@@ -246,7 +244,6 @@ class FlashVTG_ms(nn.Module):
                 output["out_class"] = out_class
                 output["out_coord"] = out_coord 
 
-
             if self.training == False:
                 assert bs == 1, "batch size larger than 1 is not supported for inference"
                 out_class = out_class.sigmoid()
@@ -255,7 +252,7 @@ class FlashVTG_ms(nn.Module):
                 output["_out"]["video_msk"] = video_msk
                 output["_out"]["saliency"] = saliency_scores[0]
 
-                if  self.args.use_dfl==False and self.coord_head is not None:
+                if self.args.use_dfl==False and self.coord_head is not None:
                     boundary = out_coord[0]
                     boundary[:, 0] *= -1
                     boundary *= point[:, 3, None].repeat(1, 2)
@@ -269,21 +266,21 @@ class FlashVTG_ms(nn.Module):
                     output["_out"]["boundary"] = boundary
 
                 elif self.args.use_dfl and self.coord_head is not None:
-                    boundary = out_coord[0]  # shape: (N, num_bins * 2)
+                    boundary = out_coord[0]
                     num_bins = self.args.num_bins
                     bin_size = self.args.sample_radius / (num_bins - 1)
 
-                    start_logits = boundary[:, :num_bins]     # (N, num_bins)
-                    end_logits = boundary[:, num_bins:]       # (N, num_bins)
+                    start_logits = boundary[:, :num_bins]
+                    end_logits = boundary[:, num_bins:]
 
-                    start_prob = F.softmax(start_logits, dim=-1)  # (N, num_bins)
-                    end_prob = F.softmax(end_logits, dim=-1)      # (N, num_bins)
+                    start_prob = F.softmax(start_logits, dim=-1)
+                    end_prob = F.softmax(end_logits, dim=-1)
 
-                    bin_centers = torch.linspace(0, self.args.sample_radius, steps=num_bins, device=boundary.device)  # (num_bins,)
+                    bin_centers = torch.linspace(0, self.args.sample_radius, steps=num_bins, device=boundary.device)
 
-                    start = torch.sum(start_prob * bin_centers[None, :], dim=-1)  # (N,)
-                    end = torch.sum(end_prob * bin_centers[None, :], dim=-1)      # (N,)
-                    boundary = torch.stack([start, end], dim=-1)  # (N, 2)
+                    start = torch.sum(start_prob * bin_centers[None, :], dim=-1)
+                    end = torch.sum(end_prob * bin_centers[None, :], dim=-1)
+                    boundary = torch.stack([start, end], dim=-1)
                     boundary[:, 0] *= -1
                     boundary = boundary * point[:, 3, None].repeat(1, 2)
                     boundary = boundary + point[:, 0, None].repeat(1, 2)
@@ -296,7 +293,7 @@ class FlashVTG_ms(nn.Module):
 
         if self.training == True and self.args.use_neg:
             ### Neg Pairs ###
-            neg_vid = ori_vid[1:] + ori_vid[:1] 
+            neg_vid = ori_vid[1:] + ori_vid[:1]
             real_neg_mask = torch.Tensor(element_wise_list_equal(ori_vid, neg_vid)).to(src_txt_dummy.device)
             real_neg_mask = ~real_neg_mask.bool()
 
@@ -306,8 +303,7 @@ class FlashVTG_ms(nn.Module):
                 src_vid_neg = src_vid[real_neg_mask]
                 vid_mask_neg = src_vid_mask[real_neg_mask]
                 phrase_emb_neg = phrase_emb_neg[real_neg_mask]
-                eos_slot_neg = torch.cat([eos_slot[1:], eos_slot[0:1]], dim=0)[real_neg_mask]
-                context_agg_neg, _, _ = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg, eos_slot_neg) # [B, N, T, C]
+                context_agg_neg, _ = self.phrase_context(phrase_emb_neg, src_vid_neg, vid_mask_neg)
 
                 # dummy neg
                 src_txt_dummy_neg = torch.cat([src_txt_dummy[1:], src_txt_dummy[0:1]], dim=0)
@@ -430,13 +426,11 @@ def build_model1(args):
                    'loss_reg': args.lw_reg,
                    "loss_cls": args.lw_cls,
                    "loss_sal": args.lw_sal,
-                   "loss_eos": args.lw_eos,
-                   "loss_phrase_sqan": args.lw_phrase,
                    "loss_phrase_slot": args.lw_phrase,
                    "loss_qfl": 0,
                    }
 
-    losses = ["saliency", 'labels', 'phrase_sqan', 'phrase_slot', 'eos', 'sal', 'reg', 'cls', 'qfl']
+    losses = ["saliency", 'labels', 'phrase_slot', 'sal', 'reg', 'cls', 'qfl']
     #losses = ["labels", "phrase"]
     from FlashVTG_ms.loss import SetCriterion
     criterion = SetCriterion(
@@ -445,3 +439,99 @@ def build_model1(args):
     )
     criterion.to(device)
     return model, criterion
+
+def visualize_all_keyword(
+    outputs, word_tokens, save_path
+):
+    """
+    첨부 이미지 스타일로 한 장에 모든 figure를 저장합니다.
+    Args:
+        outputs: model의 output dictionary
+        word_tokens: [L] (list of str, special token 제외)
+        save_path: 저장할 파일 경로
+    """
+    # numpy 변환
+    phrase_word_attn = outputs['phrase_word_attn'].detach().cpu().numpy()
+    phrase_slot_attn = outputs['phrase_slot_att'].detach().cpu().numpy()
+    selected_indices = outputs['selected_indices'].detach().cpu().numpy()
+    context = outputs['context'].detach().cpu().numpy()
+    context_refined = outputs['context_refined'].detach().cpu().numpy()
+    context_agg = outputs['context_agg'].detach().cpu().numpy()
+    vid_emb = outputs['vid_emb'].detach().cpu().numpy()
+
+    N, L = phrase_word_attn.shape
+    T = context.shape[1]
+    # L2 norm 계산
+    context_l2 = np.linalg.norm(context, axis=2)  # [N, T]
+    context_refined_l2 = np.linalg.norm(context_refined, axis=2)  # [N, T]
+    context_agg_l2 = np.linalg.norm(context_agg, axis=1)  # [T]
+    vid_emb_l2 = np.linalg.norm(vid_emb, axis=1)  # [T]
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib import gridspec
+
+    fig = plt.figure(figsize=(16, 14))
+    gs = gridspec.GridSpec(6, 1, height_ratios=[1, 1, 1.2, 1.2, 0.7, 0.7])
+
+    # 1. Phrase-Word Attention
+    ax0 = plt.subplot(gs[0])
+    sns.heatmap(phrase_word_attn, cmap='Greys', ax=ax0, cbar=True, vmin=0, vmax=phrase_word_attn.max())
+    ax0.set_title('Phrase-Word Attention')
+    ax0.set_ylabel('Phrase')
+    ax0.set_xticks(np.arange(L)+0.5)
+    ax0.set_xticklabels(word_tokens, rotation=45, ha='right', fontsize=8)
+    ax0.set_yticks(np.arange(N)+0.5)
+    ax0.set_yticklabels([f'Phrase {i+1}' for i in range(N)])
+    for i, idx in enumerate(selected_indices):
+        ax0.add_patch(plt.Rectangle((idx, i), 1, 1, fill=False, edgecolor='red', lw=2))
+
+    # 2. Phrase Slot Attention
+    ax1 = plt.subplot(gs[1])
+    sns.heatmap(phrase_slot_attn, cmap='Greys', ax=ax1, cbar=True, vmin=0, vmax=phrase_slot_attn.max())
+    ax1.set_title('Phrase Slot Attention')
+    ax1.set_ylabel('Phrase')
+    ax1.set_xticks(np.arange(L)+0.5)
+    ax1.set_xticklabels(word_tokens, rotation=45, ha='right', fontsize=8)
+    ax1.set_yticks(np.arange(N)+0.5)
+    ax1.set_yticklabels([f'Phrase {i+1}' for i in range(N)])
+    for i, idx in enumerate(selected_indices):
+        ax1.add_patch(plt.Rectangle((idx, i), 1, 1, fill=False, edgecolor='red', lw=2))
+
+    # 3. Context Activation (L2 Norm)
+    ax2 = plt.subplot(gs[2])
+    sns.heatmap(context_l2, cmap='YlOrRd', ax=ax2, cbar=True)
+    ax2.set_title('Context Activation (L2 Norm)')
+    ax2.set_ylabel('Phrase')
+    ax2.set_xlabel('Frame')
+    ax2.set_yticks(np.arange(N)+0.5)
+    ax2.set_yticklabels([f'Phrase {i+1}' for i in range(N)])
+
+    # 4. Context Refined (L2 Norm)
+    ax3 = plt.subplot(gs[3])
+    sns.heatmap(context_refined_l2, cmap='YlOrRd', ax=ax3, cbar=True)
+    ax3.set_title('Context Refined (L2 Norm)')
+    ax3.set_ylabel('Phrase')
+    ax3.set_xlabel('Frame')
+    ax3.set_yticks(np.arange(N)+0.5)
+    ax3.set_yticklabels([f'Phrase {i+1}' for i in range(N)])
+
+    # 5. Context Aggregation (L2 Norm)
+    ax4 = plt.subplot(gs[4])
+    ax4.imshow(context_agg_l2[None, :], aspect='auto', cmap='YlOrRd')
+    ax4.set_title('Context Aggregation (L2 Norm)')
+    ax4.set_ylabel('')
+    ax4.set_xlabel('Frame')
+    ax4.set_yticks([])
+
+    # 6. Video Embedding Activation (L2 Norm)
+    ax5 = plt.subplot(gs[5])
+    ax5.imshow(vid_emb_l2[None, :], aspect='auto', cmap='YlOrRd')
+    ax5.set_title('Video Embedding Activation (L2 Norm)')
+    ax5.set_ylabel('')
+    ax5.set_xlabel('Frame')
+    ax5.set_yticks([])
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close()

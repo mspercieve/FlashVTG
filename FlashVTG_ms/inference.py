@@ -24,6 +24,7 @@ import nncore
 from nncore.ops import temporal_iou
 
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -371,6 +372,7 @@ def eval_epoch(
     epoch_i=None,
     criterion=None,
     tb_writer=None,
+    eval_mode=True,
 ):
     logger.info("Generate submissions")
     model.eval()

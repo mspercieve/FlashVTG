@@ -147,53 +147,52 @@ class Phrase_Generate(nn.Module):
         
         # Phrase formation을 위한 cross attention
         self.phrase_att = nn.ModuleList([CrossAttention(hdim, num_heads, drop_p) for _ in range(num_layers)])
-        
+        self.learnable_phrase = nn.Parameter(torch.randn(1, num_phrase, hdim))
         # Position embedding
         self.pos = PositionEmbeddingSine(hdim)
-        
-        # EOS token
-        self.eos_slot = nn.Parameter(torch.randn(1, 1, hdim))
         
         # Word selection을 위한 hyperparameter
         self.min_word_distance = 2  # 선택된 단어들 사이의 최소 거리
         
-    def compute_word_importance(self, word_feats, video_feats, video_mask):
-        """단어의 중요도를 계산"""
+    def compute_word_importance(self, word_feats, video_feats, video_mask, temperature=1.0):
+        """단어의 중요도를 계산 (entropy + gate 방식, softmax scaling)"""
         B, L, C = word_feats.shape
         T = video_feats.shape[1]
-        
-        # Project features
-        word_proj = self.word_proj(word_feats)  # [B, L, C]
-        video_proj = self.video_proj(video_feats)  # [B, T, C]
-        
-        # Compute similarity matrix
-        sim_matrix = torch.bmm(word_proj, video_proj.transpose(1, 2))  # [B, L, T]
+        word_feats = self.word_proj(word_feats)
+        video_feats = self.video_proj(video_feats)
+        # Dot product 계산
+        sim_matrix = torch.bmm(word_feats, video_feats.transpose(1, 2))  # [B, L, T]
         
         # Apply mask
         if video_mask is not None:
-            sim_matrix = sim_matrix.masked_fill(~video_mask.unsqueeze(1), float('-inf'))
+            sim_matrix = sim_matrix.masked_fill(~video_mask.bool().unsqueeze(1), float('-inf'))
         
-        # Softmax along T dimension
-        attn_weights = F.softmax(sim_matrix, dim=2)  # [B, L, T]
+        # Softmax with temperature
+        attn_weights = F.softmax(sim_matrix / temperature, dim=2)  # [B, L, T]
         
-        # Compute entropy
+        # Entropy 계산
         entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-6), dim=2)  # [B, L]
+        vid_length = video_mask.sum(dim=1) # [B]
+        log_length = torch.log(vid_length + 1e-6).unsqueeze(1)
+        norm_entropy = entropy / log_length
+        gate = 1.0 - norm_entropy  # [B, L]
+        gate = gate.clamp(0, 1)  # 안정성 위해 0~1로 클램핑
         
-        return entropy, attn_weights
+        return gate, attn_weights
     
-    def select_important_words(self, entropy, word_feats, word_mask):
-        """중요한 단어들을 선택"""
-        B, L = entropy.shape
+    def select_important_words(self, gate, word_feats, word_mask):
+        """중요한 단어들을 선택 (gate 값 기준)"""
+        B, L = gate.shape
         selected_indices = []
         selected_feats = []
         
         for b in range(B):
             # Get valid word indices
             valid_indices = torch.where(word_mask[b])[0]
-            valid_entropy = entropy[b, valid_indices]
+            valid_gate = gate[b, valid_indices]
             
-            # Sort by entropy
-            sorted_indices = torch.argsort(valid_entropy, descending=True)
+            # Sort by gate (내림차순: gate가 높은 단어 우선)
+            sorted_indices = torch.argsort(valid_gate, descending=True)
             sorted_valid_indices = valid_indices[sorted_indices]
             
             # Select words with minimum distance constraint
@@ -203,15 +202,12 @@ class Phrase_Generate(nn.Module):
                     curr_indices.append(idx)
                     if len(curr_indices) == self.num_phrase:
                         break
-            
             # Pad if necessary
             while len(curr_indices) < self.num_phrase:
                 curr_indices.append(curr_indices[-1])
-            
             selected_indices.append(curr_indices)
             selected_feats.append(word_feats[b, curr_indices])
-        
-        return torch.stack(selected_feats), torch.tensor(selected_indices, device=entropy.device)
+        return torch.stack(selected_feats), torch.tensor(selected_indices, device=gate.device)
     
     def forward(self, txt_emb, txt_mask, video_feats=None, video_mask=None):
         """
@@ -229,21 +225,23 @@ class Phrase_Generate(nn.Module):
         word_pos = self.pos(word_emb, word_mask)
         word_pe = word_emb + word_pos
         
-        # 1. 단어 중요도 계산
-        entropy, word_video_attn = self.compute_word_importance(word_pe, video_feats, video_mask)
-        
-        # 2. 중요 단어 선택
-        phrase_slot, selected_indices = self.select_important_words(entropy, word_pe, word_mask)
-        
-        # 3. Cross attention으로 구 형성
-        slot_sim = None
-        for i in range(self.num_layers):
-            phrase_slot, slot_sim = self.phrase_att[i](phrase_slot, word_pe, word_mask)
-        
-        # EOS token 처리
-        eos_slot = self.eos_slot.expand(B, 1, C)
-        
-        return phrase_slot, word_video_attn, slot_sim, eos_slot
+        # 1. gate 계산 (entropy 기반)
+        gate, word_video_attn = self.compute_word_importance(word_emb, video_feats, video_mask)
+
+        # 2. 임의 초기화된 phrase slot
+        phrase_slot = self.learnable_phrase.expand(B, -1, -1)  # [B, N, C]
+        slot_attn = []
+        # 3. 첫 번째 CrossAttention (gate 적용)
+        word_gate = gate.unsqueeze(-1) * word_emb + word_pos
+        phrase_slot, attn_score = self.phrase_att[0](phrase_slot, word_gate, word_mask)
+        slot_attn.append(attn_score)
+
+        # 4. 이후 CrossAttention layer (gate 없이)
+        for i in range(1, self.num_layers):
+            phrase_slot, attn_score = self.phrase_att[i](phrase_slot, word_pe, word_mask)
+            slot_attn.append(attn_score)
+        slot_attn = torch.stack(slot_attn, dim=1).mean(dim=1)
+        return phrase_slot, word_video_attn, gate, slot_attn
 
 class SlotAttention(nn.Module):
     def __init__(self, hdim, num_heads, drop_p=0.1):
@@ -290,9 +288,9 @@ class LowRankDynamicConv(nn.Module):
         self.rank = rank
         self.t_kernels = t_kernels
 
-        # EOS slot과 phrase를 결합하기 위한 projection
-        self.combine_proj = nn.Sequential(
-            nn.Linear(2 * hdim, 4 * hdim),
+        # Phrase를 위한 projection
+        self.phrase_proj = nn.Sequential(
+            nn.Linear(hdim, 4 * hdim),
             nn.ReLU(),
             nn.Linear(4 * hdim, hdim * rank)
         )
@@ -324,17 +322,11 @@ class LowRankDynamicConv(nn.Module):
             stride=(stride[0], stride[1], stride[1], stride[2], stride[3])
         )
 
-    def forward(self, context_emb, phrase_slot, eos_slot):
+    def forward(self, context_emb, phrase_slot):
         B, T, N, C = context_emb.shape
         
-        # EOS slot을 phrase_slot과 같은 크기로 확장
-        eos_slot = eos_slot.expand(B, N, C)  # [B, N, C]
-        
-        # phrase_slot과 eos_slot을 결합
-        combined = torch.cat([phrase_slot, eos_slot], dim=-1)  # [B, N, 2C]
-        
-        # 비선형 projection을 통한 feature 추출
-        phrase_proj = self.combine_proj(combined)  # [B, N, C*r]
+        # phrase_slot을 위한 projection
+        phrase_proj = self.phrase_proj(phrase_slot)  # [B, N, C*r]
         phrase_proj = rearrange(phrase_proj, 'b n (c r) -> b n c r', c=C, r=self.rank)
 
         outputs = []
@@ -380,12 +372,10 @@ class PhraseContextLayer(nn.Module):
         )
         self.norm_t = nn.LayerNorm(hdim)
 
-    def forward(self, context_emb, phrase_emb, vid_mask, shape):
+    def forward(self, context_emb, phrase_emb, vid_mask):
         """
         context_emb: [B*N, T, C]
         """
-        B, N, T, C = shape
-        
         # T-axis self-attention (시간적 맥락)
         context_emb, _ = self.t_att(context_emb, vid_mask) # [B*N, T, C]
         t_update = self.fc_t(context_emb)
@@ -407,15 +397,14 @@ class Phrase_Context(nn.Module):
         self.pos = PositionEmbeddingSine(hdim)
         self.local_context = LowRankDynamicConv(hdim, num_phrase, rank, t_kernels)
 
-    def forward(self, phrase_slot, vid_feat, vid_mask, eos_slot):
+    def forward(self, phrase_slot, vid_feat, vid_mask):
         """
         Args:
             phrase_slot: [B, N, C] phrase slots
             vid_feat: [B, T, C] video-level features
             vid_mask: [B, T] video mask
-            eos_slot: [B, 1, C] EOS token
         Returns:
-            updated_phrase: [B, T, N, C]
+            context_agg: [B, T, C] - aggregated context features
         """
         B, T, C = vid_feat.shape
         N = phrase_slot.shape[1]
@@ -429,11 +418,10 @@ class Phrase_Context(nn.Module):
         context_emb = context_emb + pos
         
         for layer in self.layers:
-            context_emb = layer(context_emb, phrase_slot, vid_mask, (B, N, T, C))
+            context_emb = layer(context_emb, phrase_slot, vid_mask)
         context_emb = rearrange(context_emb, '(b n) t c -> b t n c', b=B, n=N)
-        context_refine_out = context_emb.permute(0, 2, 1, 3)
-        context_agg = self.local_context(context_emb, phrase_slot, eos_slot)
-        return context_agg, context_emb_out, context_refine_out
+        context_agg = self.local_context(context_emb, phrase_slot)
+        return context_agg, context_emb_out
 
 class HadamardProduct(nn.Module):
     def __init__(self, idim_1, idim_2, hdim):
